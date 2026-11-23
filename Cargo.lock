@@ -328,7 +328,6 @@ dependencies = [
  "j8compiler",
  "j8framework",
  "j8lockfree",
- "j8macros",
  "j8platform",
  "ryu-js",
 ]
