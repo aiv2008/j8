@@ -150,6 +150,11 @@ path = "tests/string_fast.rs"
 [[test]]
 name = "jit_mod"
 path = "tests/jit_mod.rs"
+
+[[test]]
+name = "param_tdz"
+path = "tests/param_tdz.rs"
+
 [lints]
 workspace = true
 
