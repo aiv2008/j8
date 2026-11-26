@@ -1,6 +1,7 @@
 use core::ffi::{c_char, c_void};
 use core::num::NonZeroUsize;
 use core::ptr::{null, null_mut};
+use core::time::Duration;
 
 use j8builtins::Builtins;
 use j8executor::{EventLoopSet, Executor};
@@ -30,6 +31,8 @@ unsafe extern "C" {
     fn napi_create_threadsafe_function(env: *mut Env, f: Handle, resource: Handle, name: Handle, max: usize, threads: usize, fin_data: *mut c_void, fin: Option<unsafe extern "C" fn(*mut Env, *mut c_void, *mut c_void)>, context: *mut c_void, call_js: CallJs, result: *mut *mut c_void) -> Status;
     fn napi_call_threadsafe_function(f: *mut c_void, data: *mut c_void, blocking: i32) -> Status;
     fn napi_release_threadsafe_function(f: *mut c_void, mode: i32) -> Status;
+    fn napi_ref_threadsafe_function(env: *mut Env, f: *mut c_void) -> Status;
+    fn napi_unref_threadsafe_function(env: *mut Env, f: *mut c_void) -> Status;
 }
 
 const SUM_TO: u32 = 1000;
@@ -105,15 +108,75 @@ unsafe extern "C" fn feed(env: *mut Env, info: *mut CallbackInfo) -> Handle {
     Handle::default()
 }
 
-unsafe extern "C" fn register(env: *mut Env, exports: Handle) -> Handle {
-    let (mut w, mut f) = (Handle::default(), Handle::default());
+unsafe fn held<'h>(env: *mut Env, info: *mut CallbackInfo) -> &'h mut *mut c_void {
+    let mut data = null_mut();
     unsafe {
-        napi_create_function(env, null(), 0, Some(work), null_mut(), &raw mut w);
-        napi_set_named_property(env, exports, c"work".as_ptr(), w);
-        napi_create_function(env, null(), 0, Some(feed), null_mut(), &raw mut f);
-        napi_set_named_property(env, exports, c"feed".as_ptr(), f);
+        napi_get_cb_info(env, info, null_mut(), null_mut(), null_mut(), &raw mut data);
+        &mut *data.cast::<*mut c_void>()
+    }
+}
+
+unsafe extern "C" fn hold(env: *mut Env, info: *mut CallbackInfo) -> Handle {
+    let cb = unsafe { first(env, info) };
+    let mut t = null_mut();
+    unsafe {
+        assert_eq!(napi_create_threadsafe_function(env, cb, Handle::default(), Handle::default(), 0, 1, null_mut(), None, null_mut(), Some(call_js), &raw mut t), Status::Ok);
+        assert_eq!(napi_unref_threadsafe_function(env, t), Status::Ok);
+    }
+    unsafe { *held(env, info) = t };
+    Handle::default()
+}
+
+unsafe extern "C" fn rehold(env: *mut Env, info: *mut CallbackInfo) -> Handle {
+    let t = unsafe { *held(env, info) };
+    unsafe { assert_eq!(napi_ref_threadsafe_function(env, t), Status::Ok) };
+    let remote = Remote(t);
+    std::thread::spawn(move || {
+        let r = remote;
+        std::thread::sleep(Duration::from_millis(50));
+        unsafe { napi_call_threadsafe_function(r.0, core::ptr::without_provenance_mut(4), 0) };
+        unsafe { napi_release_threadsafe_function(r.0, 0) };
+    });
+    Handle::default()
+}
+
+unsafe extern "C" fn register(env: *mut Env, exports: Handle) -> Handle {
+    let slot = Box::into_raw(Box::new(null_mut::<c_void>())).cast::<c_void>();
+    let methods: [(&core::ffi::CStr, unsafe extern "C" fn(*mut Env, *mut CallbackInfo) -> Handle, *mut c_void); 4] =
+        [(c"work", work, null_mut()), (c"feed", feed, null_mut()), (c"hold", hold, slot), (c"rehold", rehold, slot)];
+    for (name, cb, data) in methods {
+        let mut f = Handle::default();
+        unsafe {
+            napi_create_function(env, null(), 0, Some(cb), data, &raw mut f);
+            napi_set_named_property(env, exports, name.as_ptr(), f);
+        }
     }
     exports
+}
+
+fn text(l: &j8executor::EventLoop<'_>, script: &str) -> String {
+    let g = l.eval(&Source { text: script, file: "text.js" }, ScriptKind::Classic).expect("eval");
+    l.enter(|a| {
+        let v = a.local(&g);
+        String::from(&**a.to_string(v).expect("ToString"))
+    })
+}
+
+#[test]
+fn an_unrefd_threadsafe_function_does_not_keep_the_loop_running() {
+    let platform = DefaultPlatform::default();
+    EventLoopSet::scope(&platform, NonZeroUsize::MIN, |set| {
+        let l = set.spawn(Executor::default(), &Builtins);
+        l.enter(|a| {
+            let exports = Env::open(a, register).expect("register");
+            a.set_named(a.context.global.into(), "addon", exports).expect("global");
+        });
+        assert_eq!(text(&l, "globalThis.got = []; addon.hold(x => got.push(x)); 'held'"), "held");
+        l.run().expect("an unref'd thread-safe function lets the loop finish");
+        assert_eq!(text(&l, "addon.rehold(); 'refed'"), "refed");
+        l.run().expect("loop");
+        assert_eq!(text(&l, "got.join(' ')"), "4");
+    });
 }
 
 #[test]

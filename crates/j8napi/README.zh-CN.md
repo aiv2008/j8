@@ -29,7 +29,8 @@ scope.set_named(scope.context.global.into(), "addon", exports)?;
 - 字符串按 UTF-8 存：UTF-16 输入里落单的代理项会被替换。
 - Buffer 就是普通的 `Uint8Array`（没有 Node 的 `Buffer` 类）。
 - 异步工作与线程安全函数要 isolate 带事件循环（`EventLoopSet`）；异步工作各开一个线程跑。
-  `napi_unref_threadsafe_function` 不会让事件循环提前结束；没有 libuv 循环（`napi_get_uv_event_loop` 失败）。
+  和 Node 一样，线程安全函数在释放或 `napi_unref_threadsafe_function` 之前让事件循环一直跑（`run_until_idle` 等着它）。
+  没有 libuv 循环（`napi_get_uv_event_loop` 失败）。
 
 ## 许可
 

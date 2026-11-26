@@ -110,13 +110,14 @@ The steps are always the same:
 4. `rt.eval(text, file)` runs a script. It returns a `ScopeGlobal<'p, ValueBrand>` (a root that outlives the
    call), which `rt.text(&g)` turns into a string with ToString.
 5. `rt.run_until_idle()` waits until no async host work is left. Call it after every `eval` if your
-   bindings have `async fn`s or return promises; otherwise those promises never settle.
+   bindings have `async fn`s or return promises; otherwise those promises never settle. A spawned job made
+   with `AsyncJob::new(..).unref()` (such as an unref'd Node-API thread-safe function) still settles, but is not waited for.
 
 ### What an `Error` means
 
 | Variant | Meaning | What hosts do |
 |---|---|---|
-| `Error::Exception` | JS threw; the value waits in the isolate's pending slot, as in V8 | `rt.exception_text()` ⇒ `Uncaught …` |
+| `Error::Exception` | JS threw; the value waits in the isolate's pending slot, as in V8 | `rt.exception_text()` ⇒ `Uncaught …` with the stack ([4.4](#44-stack-traces)) |
 | `Error::Syntax(msg)` | the source does not parse | print `msg` |
 | `Error::Unsupported(msg)` | syntax j8 does not support yet | print `msg` |
 
@@ -241,6 +242,43 @@ runtime thread, this also works for the results of `async fn`s.
   TypeError instead of panicking.
 - JS values in a class are traced edges, not roots: a cycle through a host object is collected like any other.
   Outside the heap (a thread, a channel) keep a `ScopeGlobal` root instead.
+
+### 4.4 Stack traces
+
+Every error object gets a V8-style `stack`: one made with `new Error()`, one the engine throws, and one a binding
+throws with `a.throw` (its top frame is the JS call of the binding).
+
+```text
+Error: boom
+    at inner (main.js:2:10)
+    at new Box (main.js:6:14)
+    at main.js:9:1
+```
+
+- `stack` is an accessor on `Error.prototype`, as in the TC39 proposal (V8 puts one on each error instead): the text is
+  made when it is read, from the error's `name` and `message` at that time; assigning a string puts an own `stack` in
+  front of it.
+- `Error.stackTraceLimit` (10, read from `Error` itself when an error is made) caps the frames; `Error.captureStackTrace(obj)`
+  puts a `stack` on any object.
+- An error keeps only its frames (code and bytecode offset, and whether it constructs); names, scripts, lines and
+  columns are looked up when `stack` is read, so making errors that nobody reads costs no formatting.
+- `a.stack_trace(limit)` gives the JS frames running now, innermost first, as `CallSite { function, script, line,
+  column, constructor }`: lines and columns count from 1, columns in UTF-16 units, and `Display` prints the frame the
+  way `stack` does. `a.stack_text(v)` is the `stack` of a thrown value, or its ToString when it has none;
+  `Runtime::exception_text` uses it, so an uncaught error prints with its frames.
+- Not shown yet: frames of built-in functions (`at Array.map`), receiver type names (`at Object.method`), async frames
+  (`at async f`), and the frame to hide (`captureStackTrace`'s second argument). With the JIT on, the frame of a
+  function running as compiled code can be missing or point at the line it was entered on.
+
+### 4.5 Debugging
+
+`Executor::with_debugger(&d)` attaches a `Debugger` the executor borrows: `set_breakpoint(scope, script, line, column)`
+/ `clear_breakpoint(id)`, `pause_on_exceptions(mode)`, and `d.paused(&mut Paused)` called on the JS thread at every
+stop, which reads the frames (`frames`, as `CallSite`s), their scopes (`scopes`) and `this`, evaluates in a frame
+(`evaluate`) and returns `Continue`, `StepInto`, `StepOver` or `StepOut`. `pause()` stops at the next statement; from
+another thread, reach the executor with an `Interrupter` (5.7). A debugger turns the JIT off for that executor and
+compiles with debug information (statement positions, local names); without one nothing changes. See the book's
+Debugger chapter for how it works.
 
 ## 5. Async work and the event loop
 
@@ -393,7 +431,57 @@ For a JS callback that should run more than once (an event handler), keep a `j8:
 a future pending, and stop by settling it. A cleared timer should settle its promise (dune's `Timer::cancel`), or the
 loop waits for it.
 
-### 5.6 What the event loop does not do yet
+### 5.6 Unhandled rejections
+
+When the microtasks have drained, every promise that was rejected and still has no handler goes to
+`Platform::unhandled_rejection` (Node's `unhandledRejection`). The default does nothing; `HostPlatform` hands it to
+the platform it wraps:
+
+```rust,ignore
+impl Platform for MyPlatform {
+    fn unhandled_rejection<'scope>(&self, a: &mut Scope<'scope, '_>, _promise: JsObject<'scope>, reason: Value<'scope>) {
+        if let Ok(text) = a.stack_text(reason) {
+            eprintln!("Uncaught (in promise) {}", &**text);
+        }
+    }
+    // now, print, … as before
+}
+```
+
+A handler attached before the microtasks drain (`await`, `then`, `catch`) takes the promise off the list. One attached
+on a later turn does not take back a report.
+
+### 5.7 Running code on the JS thread from another thread
+
+`EventLoop::interrupter()` (or `Runtime::interrupter()`) gives an `Interrupter`, `Clone + Send`. `interrupt(f)` runs
+`f(&Executor, &mut Scope)` on the event loop's thread: in the middle of running JS at its next check (every 1024
+instructions, back edges in JIT code; a busy loop in a callback included), or at the start of the next turn when the
+loop is idle. JIT code leaves to the interpreter at the check, so `f` may run JS that changes what the machine code
+assumed. A long-running native builtin (a big `sort`, regular expression backtracking, a big `JSON.parse`) delays `f`
+until it returns. A debugger that sets a breakpoint or pauses a busy loop needs exactly this. Without a request the
+checks cost what they did before. See the book's Framework chapter.
+
+### 5.8 A heap limit
+
+`EventLoop::set_heap_limit(Some(bytes), callback)` (or `Runtime::set_heap_limit`) limits the bytes the GC heap holds
+(paragc's `Heap::used`: its blocks plus its large objects; `heap_used()` reports it). `callback` is
+`Box<dyn FnMut(current, initial) -> new_limit>`, the shape of V8's near-heap-limit callback, but it runs once the heap has
+gone past the limit, not before:
+
+- The block or large object taken past the limit interrupts the running JS (5.7). On the JS thread the callback returns
+  the new limit: JS goes on under it, and is terminated with `Error::Terminated` over it (also without a callback). V8
+  instead crashes with out of memory when the callback does not raise the limit; j8 stops the JS and keeps the process.
+  This reaches an allocating loop in a module body or a promise callback, which never reach a safe point.
+- An interrupt that arrives while no JS runs (the host allocated outside JS) does nothing; the next safe point takes over.
+- At each safe point (after a turn or a slice) the isolate runs a full collection once the heap has grown by half the
+  limit since the last one, then arms the limit again, so garbage left by earlier tasks does not count and a page whose
+  live data stays large is not collected every turn. A safe point never terminates anything.
+- Only the GC heap counts: memory objects own outside it (`ArrayBuffer` bytes, host objects' `Vec`s) does not. Within
+  one task garbage counts, because j8 collects only at safe points.
+- The limit needs an event loop: it is enforced by interrupts. `Isolate::set_heap_limit` is the piece the event loop
+  builds on; an isolate run without one only collects at safe points.
+
+### 5.9 What the event loop does not do yet
 
 - **No reactor.** Futures that need tokio's (or another runtime's) reactor never wake. Run such work on a thread
   or a reactor of your own.
@@ -406,7 +494,6 @@ loop waits for it.
 - **A panic in a future propagates out of the loop** (out of `eval` / `run_until_idle`). An error while settling
   stops the loop with the remaining work still queued.
 - **Microtasks are not sliced.** A settlement drains its microtasks to the end in one turn.
-- **Not supported yet:** reporting unhandled rejections, top-level `await`.
 
 ## 6. Modules
 
@@ -415,6 +502,12 @@ loop waits for it.
 `rt.eval_module(text, file)` runs `text` as an ES module. `DefaultPlatform` resolves `import` relative to the
 importing file (canonicalized paths, no `node_modules`). For other rules (packages, URLs, a virtual file system),
 write your own `Platform::load_module` (6.3).
+
+`eval_module` returns the promise for the module's evaluation. A module graph without top-level `await` has finished
+when `eval_module` returns, and the promise is already fulfilled. With top-level `await`, the promise settles once
+every awaiting module in the graph has finished: drive it with `run_until_idle`, then read its state with
+`Scope::promise_state`. A module that throws before it first suspends makes `eval_module` return
+`Err(Error::Exception)`, as before; one that throws later rejects the promise.
 
 ### 6.2 Native modules in Rust: `#[j8::module]`
 
@@ -467,7 +560,7 @@ let platform = Dune::platform(NodePlatform::from(DefaultPlatform::default()));
 ```
 
 Other `Platform` methods you may override: `print` (where `console.log` goes), `now` / `wall_clock` (a fake clock for
-tests).
+tests), `locale` / `time_zone` (the default locale and time zone of `Intl` and `Date`, with the `intl` feature).
 
 ## 7. Building on another runtime
 

@@ -481,7 +481,7 @@ fn poll(ctx: *mut Ctx) -> u64 {
     ctx.budget = BUDGET_CHUNK;
     if ctx.entry.is_null() {
         let (_, a) = unsafe { ctx.parts() };
-        return u64::from(a.stop.observe());
+        return u64::from(a.stop.is_set());
     }
     let e = unsafe { ctx.entry() };
     u64::from(e.spend(BUDGET_CHUNK as usize))
@@ -520,10 +520,7 @@ fn deopt(ctx: *mut Ctx, id: u64) -> u64 {
             Some(other) => return ctx.fail(other),
             None => None,
         };
-        let saved = exe.jit_depth().get();
-        let r = exe.resume_frames(a, frames, thrown);
-        exe.jit_depth().set(saved);
-        return match r {
+        return match exe.resume_frames(a, frames, thrown) {
             Ok(v) => v.bits(),
             Err(err) => ctx.fail(err),
         };

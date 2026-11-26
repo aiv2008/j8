@@ -325,7 +325,7 @@ impl Objects {
                     _ if is_array => "Array",
                     ObjectKind::Arguments(_) => "Arguments",
                     k if k.is_callable() => "Function",
-                    ObjectKind::Error => "Error",
+                    ObjectKind::Error(_) => "Error",
                     ObjectKind::Primitive(v) if matches!(v.kind(), ValueKind::Bool(_)) => "Boolean",
                     ObjectKind::Primitive(v) if v.is_number() => "Number",
                     ObjectKind::Primitive(v) if matches!(v.kind(), ValueKind::String(_)) => "String",

@@ -10,6 +10,8 @@
 - **时钟**：单调时钟用 `Instant`，`Date` 用 `SystemTime`。
 - **模块**：相对路径按引用方所在目录解析，从磁盘读（不处理 `node_modules`）。
 - `console.log` 打到标准输出。
+- **语言区域与时区**：构造时读一次，语言区域取 `LC_ALL` / `LC_MESSAGES` / `LANG`（`zh_CN.UTF-8` 变成 `zh-CN`），时区取
+  `TZ` 或 `/etc/localtime` 链接。开 `intl` feature 时 `Intl` 与 `Date` 用它们。
 
 ```rust,ignore
 let platform = j8platform::DefaultPlatform::default();            // 每个 CPU 一个工作线程
@@ -30,6 +32,9 @@ pub trait Platform: Pool {
     fn wall_clock(&self) -> Duration;             // Date 用
     fn print(&self, line: &str);                  // console.log
     fn load_module(&self, referrer: &str, specifier: &str) -> Option<(String, String)>;  // (规范化名字, 源码)
+    fn unhandled_rejection(&self, scope: &mut Scope, promise: JsObject, reason: Value);           // 默认什么也不做
+    fn locale(&self) -> Option<String>;           // BCP 47 标签，默认 None（en-US）
+    fn time_zone(&self) -> Option<String>;        // IANA 名或 ±HH:MM，默认 None（UTC）
 }
 ```
 
@@ -44,5 +49,6 @@ pub trait Platform: Pool {
 let platform = Dune::platform(NodePlatform::from(DefaultPlatform::default()));
 ```
 
-可以覆盖的方法：`print`（把 `console.log` 接到别处）、`now` / `wall_clock`（测试用假时钟）、`load_module`（包、URL、
+可以覆盖的方法：`print`（把 `console.log` 接到别处）、`now` / `wall_clock`（测试用假时钟）、`locale` / `time_zone`
+（用用户设置而不是进程环境）、`load_module`（包、URL、
 虚拟文件系统）。写法见[模块](modules.md#自定义平台)。

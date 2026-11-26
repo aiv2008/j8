@@ -32,14 +32,15 @@ impl Env<'_> {
         ObjectData { kind: ObjectKind::TypedArray(ElementKind::Uint8, view), proto: Some(a.context.typed_protos[at]), ..ObjectData::default() }.alloc(a.mc)
     }
 
-    fn spawn(a: &Scope<'_, '_>, ready: impl core::future::Future<Output = ()> + Send + 'static, settle: Settle) -> Result<(), Status> {
+    fn spawn(a: &Scope<'_, '_>, ready: impl core::future::Future<Output = ()> + Send + 'static, settle: Settle, keep_alive: bool) -> Result<(), Status> {
         let p = a.new_promise();
         let (resolve, reject) = a.promise_resolvers(p);
         let future = Box::pin(async move {
             ready.await;
             settle
         });
-        a.spawn(AsyncJob { resolve: a.global(resolve.into()), reject: a.global(reject.into()), future }).map_err(|_| Status::GenericFailure)
+        let job = AsyncJob::new(a.global(resolve.into()), a.global(reject.into()), future);
+        a.spawn(if keep_alive { job } else { job.unref() }).map_err(|_| Status::GenericFailure)
     }
 }
 
@@ -96,7 +97,7 @@ impl Work {
                 env.take_pending().map_or(Ok(Value::Undefined), Err)
             })
         });
-        Env::spawn(a, ready, settle)
+        Env::spawn(a, ready, settle, true)
     }
 }
 
@@ -155,6 +156,7 @@ pub struct Tsfn {
     threads: AtomicUsize,
     closing: AtomicBool,
     aborted: AtomicBool,
+    refed: AtomicBool,
     armed: AtomicPtr<Sender<()>>,
     context: *mut c_void,
     js: *mut c_void,
@@ -179,7 +181,7 @@ impl Tsfn {
             me.run(a);
             Ok(Value::Undefined)
         });
-        Env::spawn(a, rx, settle)?;
+        Env::spawn(a, rx, settle, self.refed.load(Ordering::Acquire))?;
         let old = self.armed.swap(Box::into_raw(Box::new(tx)), Ordering::AcqRel);
         if !old.is_null() {
             drop(unsafe { Box::from_raw(old) });
@@ -227,6 +229,12 @@ impl Tsfn {
             unsafe { cb(env.as_ptr(), js.finalize_data, self.context) };
         }
         drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
+    }
+
+    fn set_ref(&self, refed: bool) {
+        if self.refed.swap(refed, Ordering::AcqRel) != refed {
+            self.trigger();
+        }
     }
 
     fn of<'t>(p: *const Self) -> Result<&'t Self, Status> {
@@ -394,6 +402,7 @@ napi! {
             threads: AtomicUsize::new(initial_thread_count),
             closing: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
+            refed: AtomicBool::new(true),
             armed: AtomicPtr::new(core::ptr::null_mut()),
             context,
             js,
@@ -412,12 +421,12 @@ napi! {
 
     fn napi_ref_threadsafe_function(env, func: *const Tsfn) {
         let _ = env;
-        Tsfn::of(func).map(drop)
+        Tsfn::of(func).map(|t| t.set_ref(true))
     }
 
     fn napi_unref_threadsafe_function(env, func: *const Tsfn) {
         let _ = env;
-        Tsfn::of(func).map(drop)
+        Tsfn::of(func).map(|t| t.set_ref(false))
     }
 }
 

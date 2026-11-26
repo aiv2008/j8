@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use j8builtins::Builtins;
 use j8executor::Executor;
-use j8framework::{CreateParams, Error, Isolate, Source};
+use std::num::NonZeroUsize;
+
+use j8executor::EventLoopSet;
+use j8framework::{CreateParams, Error, Isolate, ScriptKind, Source};
 use j8platform::DefaultPlatform;
 
 const SPIN: Duration = Duration::from_millis(50);
@@ -30,4 +33,43 @@ fn terminate_from_another_thread() {
         String::from(&**a.to_string(v).expect("ToString"))
     });
     assert_eq!(text, "undefined undefined 2");
+}
+
+const SPINS: [(&str, &str); 4] = [
+    ("top level", "for (;;) {}"),
+    ("in a function", "function spin() { for (;;) {} } spin()"),
+    ("after an await", "async function spin() { await null; for (;;) {} } spin()"),
+    ("in a promise callback", "Promise.resolve().then(() => { for (;;) {} })"),
+];
+
+fn terminate_on_an_event_loop(jit: bool) {
+    let platform = DefaultPlatform::default();
+    for (what, text) in SPINS {
+        EventLoopSet::scope(&platform, NonZeroUsize::MIN, |set| {
+            let executor = if jit { Executor::default().with_tier(j8jit::Jit::from(0)) } else { Executor::default() };
+            let js = set.spawn(executor, &Builtins);
+            let handle = js.handle();
+            let r = std::thread::scope(|s| {
+                s.spawn(|| {
+                    std::thread::sleep(SPIN);
+                    handle.terminate();
+                });
+                js.eval(&Source { text, file: "spin.js" }, ScriptKind::Module).and_then(|_| js.run())
+            });
+            assert!(matches!(r, Err(Error::Terminated)), "{what}: {:?}", r.as_ref().err());
+            assert!(!handle.is_terminating(), "{what}: reset when the loop gives up the turn");
+            let after = js.eval(&Source { text: "1 + 1", file: "after.js" }, ScriptKind::Classic);
+            assert!(after.is_ok(), "{what}: the loop stays usable");
+        });
+    }
+}
+
+#[test]
+fn terminate_on_an_event_loop_interpreted() {
+    terminate_on_an_event_loop(false);
+}
+
+#[test]
+fn terminate_on_an_event_loop_compiled() {
+    terminate_on_an_event_loop(true);
 }

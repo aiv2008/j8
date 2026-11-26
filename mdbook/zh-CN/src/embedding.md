@@ -167,9 +167,26 @@ rt.run_until_idle()?;
 
 | 变体 | 含义 | 宿主怎么做 |
 |---|---|---|
-| `Error::Exception` | JS 抛了，值照 V8 等在 isolate 的待处理槽里 | `rt.exception_text()` ⇒ `Uncaught …` |
+| `Error::Exception` | JS 抛了，值照 V8 等在 isolate 的待处理槽里 | `rt.exception_text()` ⇒ 带调用栈的 `Uncaught …` |
 | `Error::Syntax(msg)` | 源码解析不了 | 打印 `msg` |
 | `Error::Unsupported(msg)` | j8 还不支持的写法 | 打印 `msg` |
+
+## 调用栈
+
+每个错误对象都带 V8 样式的 `stack`（`new Error()`、引擎抛的错误、绑定里 `a.throw` 抛的错误，后者最上一帧是调用绑定的那行 JS）：
+
+```text
+Error: boom
+    at inner (main.js:2:10)
+    at new Box (main.js:6:14)
+    at main.js:9:1
+```
+
+- `stack` 照 TC39 提案是 `Error.prototype` 上的访问器属性（V8 则给每个错误各放一个）：读的时候按错误当时的 `name` 和 `message` 生成；赋一个字符串会在实例上放一个自有的 `stack` 挡在前面。`Error.stackTraceLimit`（10，建错误时从 `Error` 本身读）限制帧数；`Error.captureStackTrace(obj)` 给任意对象加上 `stack`。
+- 错误只记下帧（代码、字节码偏移、是否构造调用），函数名、脚本、行列等到读 `stack` 时才查，所以建了没人读的错误不花格式化的开销。
+- `a.stack_trace(limit)` 给出正在运行的 JS 帧，最内层在前，类型是 `CallSite { function, script, line, column, constructor }`（从 1 数，列按 UTF-16 码元；`Display` 按 `stack` 里的样子打印一帧）。`a.stack_text(v)` 取抛出值的 `stack`，没有时取 ToString；`Runtime::exception_text` 用的就是它。
+- 位置来自编译器写在字节码旁的表（`BytecodeArray::positions`，字节码偏移 ⇒ 行和列），和 V8 一样标在语句、调用、`new` 和属性读取上。
+- 还不显示：内置函数的帧、接收者的类型名（`Object.method`）、异步帧、`captureStackTrace` 要隐藏的帧。打开 JIT 时，以编译代码运行的函数可能缺帧，或者指向进入它时的那一行。
 
 ## 在别的运行时上扩展
 

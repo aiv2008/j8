@@ -98,6 +98,7 @@ impl<'s, 'scope> Parser<'s, '_, 'scope, '_> {
     }
 
     fn object(&mut self) -> Result<Value<'scope>, Error> {
+        self.a.check_stack()?;
         self.pos += 1;
         self.skip_ws();
         if self.peek() == Some(b'}') {
@@ -154,6 +155,7 @@ impl<'s, 'scope> Parser<'s, '_, 'scope, '_> {
     }
 
     fn array(&mut self) -> Result<Value<'scope>, Error> {
+        self.a.check_stack()?;
         self.pos += 1;
         self.skip_ws();
         if self.peek() == Some(b']') {
@@ -314,7 +316,7 @@ struct Writer<'scope> {
     indent: String,
     allow: Option<Vec<JsString<'scope>>>,
     replacer: Option<Value<'scope>>,
-    stack: Vec<JsObject<'scope>>,
+    stack: j8framework::Visiting<'scope>,
     clean_shapes: Vec<usize>,
     clean_protos: Vec<JsObject<'scope>>,
     quoted: String,
@@ -488,12 +490,12 @@ impl<'scope> Writer<'scope> {
             ValueKind::Number(x) => push_number(out, x),
             ValueKind::BigInt(_) => return Err(a.throw(ErrorKind::Type, "Do not know how to serialize a BigInt")),
             ValueKind::Object(o) if !o.is_callable() => {
-                if self.stack.iter().any(|&s| j8framework::ScopeLocal::ptr_eq(s, o)) {
+                a.check_stack()?;
+                if !self.stack.enter(o) {
                     return Err(a.throw(ErrorKind::Type, "Converting circular structure to JSON"));
                 }
-                self.stack.push(o);
                 if a.is_array(o.into())? { self.array(a, o, out)? } else { self.object(a, o, out)? }
-                self.stack.pop();
+                self.stack.leave();
             }
             _ => return Ok(false),
         }
@@ -807,6 +809,7 @@ impl Json {
     }
 
     fn revive<'scope>(a: &mut Scope<'scope, '_>, holder: Value<'scope>, key: JsString<'scope>, reviver: Value<'scope>) -> Result<Value<'scope>, Error> {
+        a.check_stack()?;
         let v = a.get_named(holder, &key)?;
         if let Some(o) = v.as_object() {
             let keys = Writer::keys(o);
@@ -859,7 +862,7 @@ impl Json {
             indent: String::new(),
             allow,
             replacer,
-            stack: Vec::with_capacity(8),
+            stack: j8framework::Visiting::default(),
             clean_shapes: Vec::new(),
             clean_protos: Vec::new(),
             quoted: String::new(),

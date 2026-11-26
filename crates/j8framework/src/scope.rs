@@ -55,6 +55,14 @@ pub trait Invoke<'scope> {
     fn callback(&self, _agent: &mut Scope<'scope, '_>, callee: Value<'scope>, this: Value<'scope>) -> Callback<'scope> {
         Callback::from((callee, this))
     }
+
+    fn capture(&self, _agent: &Scope<'scope, '_>, _limit: usize) -> Vec<crate::Captured> {
+        Vec::new()
+    }
+
+    fn call_site(&self, _agent: &Scope<'scope, '_>, _frame: &crate::Captured) -> crate::CallSite {
+        crate::CallSite::default()
+    }
 }
 
 pub type CallbackRun = for<'scope, 'x> unsafe fn(&mut Scope<'scope, 'x>, &Callback<'scope>, &[Value<'scope>]) -> Option<Result<Value<'scope>, Error>>;
@@ -122,16 +130,102 @@ pub struct Scope<'scope, 'x> {
     pub new_target: Value<'scope>,
     pub invoke: &'x dyn Invoke<'scope>,
     pub spawned: Option<&'x j8lockfree::Fifo<crate::AsyncJob<'x>>>,
+    pub timers: Option<&'x crate::Timers<'x>>,
     pub stop: &'x crate::Termination,
     pub parked: &'x core::cell::RefCell<crate::Parked<'x>>,
     pub spare_regs: Vec<Vec<Value<'scope>>>,
+    pub(crate) heap_limit: Option<&'x crate::HeapLimit<'x>>,
+    pub(crate) stack_limit: usize,
+    pub(crate) joining: Visiting<'scope>,
+    pub gc_safe: core::cell::Cell<bool>,
+    pub handles: Vec<Value<'scope>>,
     #[cfg(all(target_os = "linux", feature = "crossheap"))]
     pub shares: &'x mut crate::Shares<'x>,
 }
 
 
+#[derive(Default)]
+pub struct Visiting<'scope>(Vec<JsObject<'scope>>);
+
+impl<'scope> Visiting<'scope> {
+    pub fn enter(&mut self, o: JsObject<'scope>) -> bool {
+        if self.0.iter().any(|&v| ScopeLocal::ptr_eq(v, o)) {
+            return false;
+        }
+        self.0.push(o);
+        true
+    }
+
+    pub fn leave(&mut self) {
+        self.0.pop();
+    }
+}
+
 impl<'scope> Scope<'scope, '_> {
+    pub fn check_heap_limit(&self) {
+        let Some(limit) = self.heap_limit else { return };
+        let gc = self.mc.gc_scope();
+        if gc.used() > limit.current() {
+            limit.pending().set(true);
+            self.stop.request_collect();
+        } else {
+            gc.set_limit(Some(limit.current()));
+        }
+    }
+
+    pub fn heap_limit_pending(&self) -> bool {
+        self.heap_limit.is_some_and(|l| l.pending().get())
+    }
+
+    pub fn recheck_heap_limit(&self) {
+        let Some(limit) = self.heap_limit else { return };
+        if !limit.pending().replace(false) {
+            return;
+        }
+        let gc = self.mc.gc_scope();
+        if limit.exceeded(gc.used()) {
+            self.stop.request();
+        } else {
+            gc.set_limit(Some(limit.current()));
+        }
+    }
+
     const SPARE_REGS: usize = 8;
+
+    pub fn after(&self, delay: core::time::Duration, keep_alive: bool) -> Result<(crate::JsObject<'scope>, u64), Error> {
+        let Some(timers) = self.timers else { return Err(self.throw(crate::ErrorKind::Type, "timers need a runtime with an event loop (j8::Runtime::run_until_idle)")) };
+        let promise = self.new_promise();
+        let (resolve, _) = self.promise_resolvers(promise);
+        Ok((promise, timers.arm(self.platform.now().saturating_add(delay), keep_alive, self.global(resolve.into()))))
+    }
+
+    pub fn cancel_after(&self, id: u64) {
+        if let Some(timers) = self.timers {
+            timers.cancel(id);
+        }
+    }
+
+    #[inline]
+    fn stack_address() -> usize {
+        let marker = 0u8;
+        core::hint::black_box(core::ptr::addr_of!(marker)) as usize
+    }
+
+    pub(crate) fn stack_limit_here(size: usize) -> usize {
+        Self::stack_address().saturating_sub(size)
+    }
+
+    #[inline]
+    pub fn check_stack(&self) -> Result<(), Error> {
+        if Self::stack_address() < self.stack_limit {
+            return Err(self.throw(crate::ErrorKind::Range, "Maximum call stack size exceeded"));
+        }
+        Ok(())
+    }
+
+    pub fn joining(&mut self) -> &mut Visiting<'scope> {
+        &mut self.joining
+    }
 
     pub fn spawn<'i>(&self, job: crate::AsyncJob<'i>) -> Result<(), crate::AsyncJob<'i>> {
         match self.spawned {
@@ -168,6 +262,24 @@ impl<'scope> Scope<'scope, '_> {
 
 impl<'scope> Scope<'scope, '_> {
     pub fn call(&mut self, callee: Value<'scope>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+        let invoke = self.invoke;
+        invoke.call(self, callee, this, args)
+    }
+
+    pub fn holding<R>(&mut self, held: &mut [Value<'scope>], f: impl FnOnce(&mut Self) -> R) -> (R, bool) {
+        let mark = self.handles.len();
+        let before = self.mc.generation();
+        self.handles.extend_from_slice(held);
+        self.gc_safe.set(true);
+        let r = f(self);
+        self.gc_safe.set(false);
+        held.copy_from_slice(&self.handles[mark..mark + held.len()]);
+        self.handles.truncate(mark);
+        (r, self.mc.generation() != before)
+    }
+
+    pub fn call_safe(&mut self, callee: Value<'scope>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+        self.gc_safe.set(true);
         let invoke = self.invoke;
         invoke.call(self, callee, this, args)
     }

@@ -107,6 +107,10 @@ impl Math {
 `run_until_idle` 在没有待定的东西时返回。重复定时器、服务器之类靠**一直留着一个待定的 future** 保活，靠兑现它停止。
 清掉的定时器应该兑现它的 promise（dune 的 `Timer::cancel`），否则循环会一直等它。
 
+## 未处理的拒绝
+
+微任务排空后，被拒绝、到这时还没有处理函数的 promise 逐个交给 `Platform::unhandled_rejection(scope, promise, reason)`（相当于 Node 的 `unhandledRejection`）；在这之前挂上的处理函数（`await`、`then`、`catch`）会把它从名单里拿掉，之后的回合才挂上的不会撤回已经报告的。默认什么也不做，`HostPlatform` 转给它包着的平台。要打印的文字用 `scope.stack_text(reason)` 取。
+
 ## 事件循环还不做的事
 
 - **没有反应堆**：需要 tokio（或别的运行时）反应堆的 future 永远不醒。
@@ -116,4 +120,3 @@ impl Math {
 - **`async fn` 不能收 `&self`**：用 `Glue::spawn`。
 - **future 里的 panic 会传出循环**（从 `eval` / `run_until_idle` 出去）；兑现时出错会停下循环，剩下的活留在队列里。
 - **微任务不分片**：一次兑现把它的微任务一口气排空。
-- **还不支持**：报告未处理的拒绝、顶层 `await`。

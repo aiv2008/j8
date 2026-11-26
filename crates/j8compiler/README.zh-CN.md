@@ -12,14 +12,15 @@
 ## 用法
 
 ```rust
-use j8compiler::Compile;
+use j8compiler::{Compile, DebugInfo};
 use j8framework::{CodeKind, Source};
 
-let module = j8bytecode::Module::compile(&Source { text: "1 + 2", file: "a.js" }, CodeKind::Script)?;
-let (module, info) = j8bytecode::Module::compile_module(&source)?;  // ES 模块，连同导入 / 导出信息
+let module = j8bytecode::Module::compile(&Source { text: "1 + 2", file: "a.js" }, CodeKind::Script, DebugInfo::Omit)?;
+let (module, info) = j8bytecode::Module::compile_module(&source, DebugInfo::Omit)?;  // ES 模块，连同导入 / 导出信息
 ```
 
-`Compile::compile_direct` 按调用点的作用域表编直接 eval 的代码。这些都由 `j8executor` 自己调用，宿主一般不直接用。
+`Compile::compile_direct` 按调用点的作用域表编直接 eval 的代码。`DebugInfo::Record` 另外为调试器记下语句位置和局部变量名
+（`BytecodeArray::debug`）。这些都由 `j8executor` 自己调用，宿主一般不直接用。
 
 ## 许可
 

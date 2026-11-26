@@ -102,12 +102,33 @@ for (k, v) in items {
 看到请求后抛 `Error::Terminated`。它不是 JS 异常，`catch` / `finally` 都接不住，一路传到最外层；传出最外层时自动复位，
 isolate 接着能用。
 
+## 中断执行
+
+`Interrupter`（由 `EventLoop::interrupter` 或 `Runtime::interrupter` 取得）让任意线程把一段闭包交给事件循环的 JS 线程执行
+（V8 的 `RequestInterrupt`）：`interrupter.interrupt(|executor, scope| …)` 把闭包排进执行器的队列，置中断位并唤醒事件循环。
+正在跑的 JS 在终止用的检查点（每 1024 条指令；JIT 机器码在回跳）看到它，带着执行器和当前作用域跑完队列里的闭包后接着执行。
+JIT 机器码不在自己的帧里跑闭包：它在检查点去优化，由解释器跑完闭包、从同一条指令接着执行，所以闭包跑 JS 改了全局变量或对象
+形状，也不会破坏机器码的推测前提。事件循环空闲时在下一轮开头执行，闭包不必等下一段 JS。长时间运行的原生内建函数（大数组的
+`sort`、正则回溯、大段 `JSON.parse`）内部没有检查点，中断要等它返回。
+
+终止字节有两种用途：低位存终止状态（已请求、展开中），另一位表示有待处理的中断。终止只读写自己的位，和待处理的中断并存时行为
+不变。没有请求时检查点仍只读一次这个字节；两种请求都在字节非零才进入的那个分支里处理。
+
+## 堆上限
+
+`EventLoop::set_heap_limit(Some(bytes), callback)` 限制 GC 堆持有的字节（paragc 的 `Heap::used`：块加大对象）。isolate 在 paragc 里设上限，paragc
+只在取块或取大对象时检查；越过上限的第一次调钩子，事件循环的钩子排一个中断。中断在 JS 线程上由 `Scope::check_heap_limit` 向
+`callback(current, initial)` 要新上限（形状照 V8 的接近上限回调，但在越过上限之后才调）：低于它就继续跑，否则中止 JS；V8 此时是内存耗尽崩溃。
+没有 JS 在跑时处理到的中断什么都不做。每个安全点上，堆从上次完整回收以来长了上限的一半，就先做一次完整回收，再重新设上限：之前任务留下的垃圾
+不算数，存活数据一直很大的页面也不会每轮都整堆回收。GC 堆之外的内存（`ArrayBuffer` 的字节）不计入。
+
 ## 其他部件
 
 | 文件 | 内容 |
 |---|---|
 | `promise.rs` | Promise 与微任务：resolve / reject、`then` 反应、驱动 async 协程、排空队列 |
 | `module.rs` | 模块记录、导入导出条目、`ResolvedBinding` |
+| `evaluation.rs` | 模块求值：循环模块记录的算法、顶层 `await` 与求值的 promise |
 | `proxy.rs` | Proxy：内部方法入口分派到 trap，带不变式检查 |
 | `typed.rs`、`backing.rs` | TypedArray 元素；ArrayBuffer 的字节放在哪（自己的、宿主映射的、几个 isolate 共享的） |
 | `text.rs` | 字符串（见[对象模型](objects.md)） |

@@ -5,8 +5,12 @@
 `rt.eval_module(text, file)` 把 `text` 当 ES 模块跑。`DefaultPlatform` 按引用方的文件解析 `import`（规范化路径，不处理
 `node_modules`）。别的规则（包、URL、虚拟文件系统）就自己写 `Platform::load_module`。
 
-执行器侧：加载、链接、求值都是同步的；import 绑定实时读导出方的槽；`ResolveExport` 处理间接导出、`export *`、歧义；
-支持命名空间对象、动态 `import()`、`import.meta`。顶层 `await` 还不支持。
+`eval_module` 返回这个模块求值的 promise。没有顶层 `await` 时，`eval_module` 返回时它已经兑现；有顶层 `await` 时，
+由 `run_until_idle` 推进等待中的模块，整张模块图跑完它才落定。模块在第一次挂起前抛出的错误，`eval_module` 仍然直接返回错误。
+
+执行器侧：加载、链接是同步的；求值按规范的循环模块记录来做，用了顶层 `await` 的模块当作 async 函数跑，导入它的模块等它
+跑完再跑。import 绑定实时读导出方的槽；`ResolveExport` 处理间接导出、`export *`、歧义；支持命名空间对象、动态
+`import()`、`import.meta`。
 
 ## Rust 写的原生模块：`#[j8::module]`
 

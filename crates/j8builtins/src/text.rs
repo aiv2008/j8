@@ -146,7 +146,10 @@ impl Texts {
         Ok(a.string(s.as_str()).into())
     }
 
-    fn locale_compare<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+    locale_method!(locale_compare, crate::intl::Collators::locale_compare, Self::locale_compare_plain);
+
+    #[cfg(not(feature = "intl"))]
+    fn locale_compare_plain<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let s = Self::this_string(a, this)?;
         let t = a.to_string(args.at(0))?;
         let (x, y): (String, String) = (s.nfc().collect(), t.nfc().collect());
@@ -339,7 +342,10 @@ impl Texts {
         Ok(a.string(&alloc::format!("{sign}{s}")).into())
     }
 
-    fn to_locale_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+    locale_method!(to_locale_string, crate::intl::NumberFormats::number_to_locale_string, Self::to_locale_string_plain);
+
+    #[cfg(not(feature = "intl"))]
+    fn to_locale_string_plain<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let x = Self::this_number(a, this, "toLocaleString")?;
         Ok(a.to_string(x.into())?.into())
     }
@@ -503,7 +509,10 @@ impl Texts {
         Self::as_n(a, args, false)
     }
 
-    fn bigint_to_locale_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+    locale_method!(bigint_to_locale_string, crate::intl::NumberFormats::bigint_to_locale_string, Self::bigint_to_locale_string_plain);
+
+    #[cfg(not(feature = "intl"))]
+    fn bigint_to_locale_string_plain<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         match this.unwrapped().kind() {
             ValueKind::BigInt(b) => Ok(a.string(&b.0.to_str_radix(10)).into()),
             _ => Err(a.throw(ErrorKind::Type, "BigInt.prototype.toLocaleString requires that 'this' be a BigInt")),

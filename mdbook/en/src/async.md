@@ -117,6 +117,13 @@ another binding.
 future pending**, and stop by settling it. A cleared timer should settle its promise (dune's `Timer::cancel`), or the
 loop waits for it.
 
+## Unhandled rejections
+
+When the microtasks have drained, every promise that was rejected and still has no handler goes to
+`Platform::unhandled_rejection(scope, promise, reason)` (Node's `unhandledRejection`); a handler attached before that
+(`await`, `then`, `catch`) takes it off the list, one attached on a later turn doesn't take a report back. The default
+does nothing and `HostPlatform` passes it to the platform it wraps. `scope.stack_text(reason)` gives the text to print.
+
 ## Not yet
 
 - **No reactor**: futures needing tokio's (or another runtime's) reactor never wake.
@@ -128,4 +135,3 @@ loop waits for it.
 - **A panic in a future propagates out of the loop** (out of `eval` / `run_until_idle`); an error while settling stops
   the loop with the remaining work still queued.
 - **Microtasks aren't sliced**: a settlement drains its microtasks in one turn.
-- **Not supported yet**: reporting unhandled rejections, top-level `await`.

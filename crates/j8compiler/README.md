@@ -13,14 +13,15 @@ source ─ oxc parser + semantic checks ─▶ AST ─ scope resolution ─ code
 ## Usage
 
 ```rust
-use j8compiler::Compile;
+use j8compiler::{Compile, DebugInfo};
 use j8framework::{CodeKind, Source};
 
-let module = j8bytecode::Module::compile(&Source { text: "1 + 2", file: "a.js" }, CodeKind::Script)?;
-let (module, info) = j8bytecode::Module::compile_module(&source)?;  // an ES module plus its imports / exports
+let module = j8bytecode::Module::compile(&Source { text: "1 + 2", file: "a.js" }, CodeKind::Script, DebugInfo::Omit)?;
+let (module, info) = j8bytecode::Module::compile_module(&source, DebugInfo::Omit)?;  // an ES module plus its imports / exports
 ```
 
-`Compile::compile_direct` compiles direct-eval code against the call site's scope table. `j8executor` calls all of
+`Compile::compile_direct` compiles direct-eval code against the call site's scope table. `DebugInfo::Record` also keeps
+statement positions and local variable names for a debugger (`BytecodeArray::debug`). `j8executor` calls all of
 these itself; embedders normally don't.
 
 ## License

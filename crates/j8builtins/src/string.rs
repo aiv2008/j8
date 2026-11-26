@@ -218,6 +218,10 @@ impl Strings {
         Ok(v)
     }
 
+    locale_method!(to_locale_upper_case, crate::intl::Cases::to_upper, Self::to_upper_case);
+
+    locale_method!(to_locale_lower_case, crate::intl::Cases::to_lower, Self::to_lower_case);
+
     fn to_upper_case<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let s = Self::this(a, this)?;
         Ok(Self::case(a, s, str::to_uppercase))
@@ -441,8 +445,8 @@ impl Installer<'_, '_> {
             ("padStart", Strings::pad_start, 1),
             ("padEnd", Strings::pad_end, 1),
             ("concat", Strings::concat, 1),
-            ("toLocaleUpperCase", Strings::to_upper_case, 0),
-            ("toLocaleLowerCase", Strings::to_lower_case, 0),
+            ("toLocaleUpperCase", Strings::to_locale_upper_case, 0),
+            ("toLocaleLowerCase", Strings::to_locale_lower_case, 0),
             ("trimLeft", Strings::trim_start, 0),
         ];
         for (name, f, n) in methods {

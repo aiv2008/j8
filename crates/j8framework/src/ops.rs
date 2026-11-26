@@ -324,7 +324,7 @@ impl<'scope> Scope<'scope, '_> {
     }
 
     pub fn error(&self, kind: ErrorKind, message: &str) -> JsObject<'scope> {
-        let e = ObjectData { kind: ObjectKind::Error, proto: Some(self.context.error_proto(kind)), ..ObjectData::default() }.alloc(self.mc);
+        let e = ObjectData { kind: ObjectKind::Error(self.capture()), proto: Some(self.context.error_proto(kind)), ..ObjectData::default() }.alloc(self.mc);
         let m = self.string(message);
         e.borrow_mut(self.mc).define("message", Property::hidden(m.into()));
         e
@@ -336,6 +336,10 @@ impl<'scope> Scope<'scope, '_> {
 
     pub fn throw_value(&self, v: Value<'scope>) -> Error {
         self.mc.raise(v)
+    }
+
+    pub fn rethrow(&self, v: Value<'scope>) -> Error {
+        self.mc.rethrow(v)
     }
 
     pub fn take_exception(&self) -> Value<'scope> {

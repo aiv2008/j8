@@ -1,19 +1,21 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use j8::frame::{Scope, Error, Value};
-use j8::Glue;
 
-use crate::host::Offload;
+const UNARMED: u64 = u64::MAX;
+const MS_PER_S: f64 = 1e3;
 
-#[derive(Default, j8::Trace)]
+#[derive(j8::Trace)]
 pub struct Timer {
     #[collect(require_static)]
-    cancelled: Arc<AtomicBool>,
+    armed: AtomicU64,
+}
+
+impl Default for Timer {
+    fn default() -> Self {
+        Self { armed: AtomicU64::new(UNARMED) }
+    }
 }
 
 #[j8::class]
@@ -23,28 +25,19 @@ impl Timer {
         Self::default()
     }
 
-    fn wait<'scope>(&self, a: &mut Scope<'scope, '_>, ms: f64) -> Result<Value<'scope>, Error> {
-        let sleep = Sleep { cancelled: self.cancelled.clone(), slept: Offload::new(move || std::thread::sleep(Duration::from_secs_f64(ms.max(0.0) / 1e3))) };
-        Glue::spawn(a, async move { Glue::settle(sleep.await) })
-    }
-
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-}
-
-struct Sleep<F> {
-    cancelled: Arc<AtomicBool>,
-    slept: Offload<(), F>,
-}
-
-impl<F: FnOnce() + Send + 'static> Future for Sleep<F> {
-    type Output = bool;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Poll::Ready(false);
+    fn wait<'scope>(&self, a: &mut Scope<'scope, '_>, ms: f64, keep_alive: Option<bool>) -> Result<Value<'scope>, Error> {
+        let (promise, id) = a.after(Duration::from_secs_f64(ms.max(0.0) / MS_PER_S), keep_alive.unwrap_or(true))?;
+        let previous = self.armed.swap(id, Ordering::AcqRel);
+        if previous != UNARMED {
+            a.cancel_after(previous);
         }
-        Pin::new(&mut self.slept).poll(cx).map(|()| true)
+        Ok(promise.into())
+    }
+
+    fn cancel(&self, a: &mut Scope<'_, '_>) {
+        let id = self.armed.swap(UNARMED, Ordering::AcqRel);
+        if id != UNARMED {
+            a.cancel_after(id);
+        }
     }
 }

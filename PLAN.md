@@ -2,7 +2,7 @@
 
 The main line is raising the test262 pass rate. Each phase: add cases to the semantics table → clippy clean → run the test262 baseline in a snapshot with zero regressions → record newly passing cases in the relevant directories with `J8_TEST262_UPDATE=1` → commit and push.
 
-Out of scope: Temporal, intl402, ShadowRealm, explicit resource management (using / DisposableStack), import defer, decorators, source phase imports.
+Out of scope: Temporal, ShadowRealm, explicit resource management (using / DisposableStack), import defer, decorators, source phase imports.
 
 ## Phase 1: infrastructure
 
@@ -33,7 +33,7 @@ Out of scope: Temporal, intl402, ShadowRealm, explicit resource management (usin
 
 ## Phase 5: Date / RegExp / strings and numbers
 
-- [x] Date (local time zone treated as UTC)
+- [x] Date (local time zone from the platform with the `intl` feature, UTC otherwise)
 - [x] RegExp Symbol protocol, RegExpExec, generic flags getter, lastIndex, `d`, species, compile, escape
 - [x] String completion (fromCodePoint / raw / normalize / annexB etc.; strings are still stored as UTF-8, so lone surrogates are lost)
 - [x] Number formatting (toFixed / toPrecision / toExponential with exact decimals), Math completion (including sumPrecise / f16round)
@@ -46,4 +46,16 @@ Out of scope: Temporal, intl402, ShadowRealm, explicit resource management (usin
 - [x] annexB block-level function hoisting (functions and scripts, including function declarations in if clauses; not yet in eval code)
 - [x] Generators / async generators initialize parameters at call time (errors throw synchronously)
 - [x] arguments linked to parameters (non-strict, simple parameters: parameters go into the environment, indices map to slots, the link breaks after delete / redefining as accessor / making read-only)
-- [x] Modules and dynamic import: module environment, import bindings read the exporter's slots live, ResolveExport (indirect / star / ambiguous), namespace objects, import(), import.meta, `Platform::load_module`; the runner runs harness scripts first, then the module (top-level await, import defer / source phase not yet)
+- [x] Modules and dynamic import: module environment, import bindings read the exporter's slots live, ResolveExport (indirect / star / ambiguous), namespace objects, import(), import.meta, `Platform::load_module`; the runner runs harness scripts first, then the module; top-level await follows the cyclic module record evaluation (import defer / source phase not yet)
+
+## Phase 7: Intl (the `intl` feature)
+
+- [x] Locales: `Intl.getCanonicalLocales`, `supportedLocalesOf`, ResolveLocale over ICU4X's likely-subtags data, `Intl.supportedValuesOf`; the default locale and time zone come from `Platform::locale` / `Platform::time_zone`
+- [x] `Intl.Collator`, `String.prototype.localeCompare`, `toLocaleUpperCase` / `toLocaleLowerCase`
+- [x] `Intl.NumberFormat` (rounding, significant / fraction digits, scientific / engineering / compact notation, sign display, `formatToParts`), `Number` / `BigInt` `toLocaleString`
+- [x] `Intl.DateTimeFormat` (components, `dateStyle` / `timeStyle`, IANA time zones and offsets, `formatToParts`), `Date` `toLocale*String`, Date's local time zone
+- [x] `Intl.PluralRules` (`select`, `selectRange`)
+- [x] `Intl.ListFormat`, `Intl.Segmenter` (grapheme / word / sentence, `containing`, segment iterators), `Intl.Locale` (options, getters, `maximize` / `minimize`, `getCalendars` / `getCollations` / `getHourCycles` / `getNumberingSystems` / `getTimeZones` / `getTextInfo` / `getWeekInfo`); ICU4X cannot hold 5–8 letter language subtags
+- [x] `Intl.RelativeTimeFormat`, `Intl.DisplayNames` (language / region / script names from icu_experimental; currency, calendar and dateTimeField fall back to the code)
+- [x] `Intl.DurationFormat` (PartitionDurationFormatPattern over NumberFormat + ListFormat), CLDR unit patterns for the duration / length / mass / volume / area units ICU4X ships
+- [ ] `formatRange` / `formatRangeToParts`, CLDR currency / percent patterns and the remaining units, the legacy `Intl.FallbackSymbol`

@@ -7,6 +7,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 use j8framework::{CodeKind, CompareOp, Error, ImportEntry, ImportName, ModuleInfo, Source};
 
+use crate::lines::Lines;
 use crate::builder::{Builder, JumpTable, Label, RegisterList};
 use crate::scope::{Decl, DeclKind, Decls, Hidden, Key, Resolver, NEW_TARGET, THIS};
 use j8bytecode::{Bytecode, ClassBoilerplate, ClassMember, Constant, Context, ContextVariable, MemberKind, CreateClosureFlags, FunctionKind, GlobalDeclaration, Module, Register, Runtime, ScopeInfo, ScopeType, SharedFunction, VariableMode, VariableRole, EvalDeclaration};
@@ -45,6 +46,7 @@ struct Level<'a> {
     dynamic: bool,
     mark: i32,
     switch: bool,
+    locals: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -212,7 +214,7 @@ struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    fn finish(self) -> SharedFunction {
+    fn finish(self, lines: &Lines<'_>) -> SharedFunction {
         SharedFunction {
             name: self.name,
             kind: self.flavor.v8_kind(self.default_constructor),
@@ -220,7 +222,7 @@ impl Frame<'_> {
             length: self.length,
             formal_parameters: self.formals,
             scope: self.scope,
-            bytecode: self.b.finish(),
+            bytecode: self.b.finish(lines),
         }
     }
 }
@@ -239,6 +241,7 @@ const RESUME_THROW: i32 = 2;
 
 pub struct Compiler<'a, 's> {
     src: &'s Source<'s>,
+    lines: Lines<'s>,
     pub alloc: &'a Allocator,
     used: HashSet<Key>,
     class_depth: u32,
@@ -255,6 +258,7 @@ pub struct Compiler<'a, 's> {
     pub classes: Vec<ClassInfo<'a>>,
     pub next_home: Option<&'static str>,
     pub hidden: bool,
+    debug: DebugInfo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,36 +371,43 @@ impl Rewriter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugInfo {
+    #[default]
+    Omit,
+    Record,
+}
+
 pub trait Compile: Sized {
-    fn compile(src: &Source<'_>, kind: CodeKind) -> Result<Self, Error>;
+    fn compile(src: &Source<'_>, kind: CodeKind, debug: DebugInfo) -> Result<Self, Error>;
 
-    fn compile_direct(src: &Source<'_>, strict: bool, hidden: bool) -> Result<Self, Error>;
+    fn compile_direct(src: &Source<'_>, strict: bool, hidden: bool, debug: DebugInfo) -> Result<Self, Error>;
 
-    fn compile_eval(src: &Source<'_>, kind: CodeKind, hidden: bool) -> Result<Self, Error>;
+    fn compile_eval(src: &Source<'_>, kind: CodeKind, hidden: bool, debug: DebugInfo) -> Result<Self, Error>;
 
-    fn compile_module(src: &Source<'_>) -> Result<(Self, ModuleInfo), Error>;
+    fn compile_module(src: &Source<'_>, debug: DebugInfo) -> Result<(Self, ModuleInfo), Error>;
 }
 
 impl Compile for Module {
-    fn compile(src: &Source<'_>, kind: CodeKind) -> Result<Self, Error> {
-        Compiler::compile_in(src, kind, false, false)
+    fn compile(src: &Source<'_>, kind: CodeKind, debug: DebugInfo) -> Result<Self, Error> {
+        Compiler::compile_in(src, kind, false, false, debug)
     }
 
-    fn compile_direct(src: &Source<'_>, strict: bool, hidden: bool) -> Result<Self, Error> {
-        Compiler::compile_in(src, if strict { CodeKind::StrictEval } else { CodeKind::Eval }, true, hidden)
+    fn compile_direct(src: &Source<'_>, strict: bool, hidden: bool, debug: DebugInfo) -> Result<Self, Error> {
+        Compiler::compile_in(src, if strict { CodeKind::StrictEval } else { CodeKind::Eval }, true, hidden, debug)
     }
 
-    fn compile_eval(src: &Source<'_>, kind: CodeKind, hidden: bool) -> Result<Self, Error> {
-        Compiler::compile_in(src, kind, false, hidden)
+    fn compile_eval(src: &Source<'_>, kind: CodeKind, hidden: bool, debug: DebugInfo) -> Result<Self, Error> {
+        Compiler::compile_in(src, kind, false, hidden, debug)
     }
 
-    fn compile_module(src: &Source<'_>) -> Result<(Self, ModuleInfo), Error> {
-        Compiler::compile_module(src)
+    fn compile_module(src: &Source<'_>, debug: DebugInfo) -> Result<(Self, ModuleInfo), Error> {
+        Compiler::compile_module(src, debug)
     }
 }
 
 impl Compiler<'_, '_> {
-    fn compile_in(src: &Source<'_>, kind: CodeKind, direct: bool, hidden: bool) -> Result<Module, Error> {
+    fn compile_in(src: &Source<'_>, kind: CodeKind, direct: bool, hidden: bool, debug: DebugInfo) -> Result<Module, Error> {
         let allocator = Allocator::default();
         let options = ParseOptions { parse_regular_expression: true, ..ParseOptions::default() };
         let ret = Parser::new(&allocator, src.text, SourceType::script()).with_options(options).parse();
@@ -413,7 +424,7 @@ impl Compiler<'_, '_> {
         let strict = kind == CodeKind::StrictEval || Flavor::use_strict(&program.directives);
         let local = (kind != CodeKind::Script).then(|| Decls::eval_local(&program.body, strict));
         let Resolver { captured, used, eval_fns, suspends, .. } = Resolver::script(&program.body, Decls::this_key(program.span), &allocator, local.as_ref(), strict, eval_scopes, None);
-        let mut c = Compiler { src, alloc: &allocator, captured, used, class_depth: 0, module: Vec::new(), frames: Vec::new(), levels: Vec::new(), chains: Vec::new(), eval_fns, suspends, completion_assign: HashSet::new(), completion_reset: HashSet::new(), for_init_text: None, classes: Vec::new(), next_home: None, hidden };
+        let mut c = Compiler { src, lines: Lines::from(src.text), alloc: &allocator, captured, used, class_depth: 0, module: Vec::new(), frames: Vec::new(), levels: Vec::new(), chains: Vec::new(), eval_fns, suspends, completion_assign: HashSet::new(), completion_reset: HashSet::new(), for_init_text: None, classes: Vec::new(), next_home: None, hidden, debug };
         c.script(program, local.as_ref(), strict, direct)?;
         Ok(Module { functions: c.module })
     }
@@ -506,7 +517,7 @@ impl<'a> Layout<'a> {
 }
 
 impl Compiler<'_, '_> {
-    fn compile_module(src: &Source<'_>) -> Result<(Module, ModuleInfo), Error> {
+    fn compile_module(src: &Source<'_>, debug: DebugInfo) -> Result<(Module, ModuleInfo), Error> {
         let allocator = Allocator::default();
         let options = ParseOptions { parse_regular_expression: true, ..ParseOptions::default() };
         let ret = Parser::new(&allocator, src.text, SourceType::mjs()).with_options(options).parse();
@@ -523,7 +534,7 @@ impl Compiler<'_, '_> {
         let (names, info) = Compiler::module_layout(program);
         let order: Vec<&str> = names.iter().map(|&(n, _)| n).collect();
         let Resolver { captured, used, eval_fns, suspends, suspend_count, .. } = Resolver::script(&program.body, Decls::this_key(program.span), &allocator, None, true, eval_scopes, Some(&[order]));
-        let mut c = Compiler { src, alloc: &allocator, captured, used, class_depth: 0, module: Vec::new(), frames: Vec::new(), levels: Vec::new(), chains: Vec::new(), eval_fns, suspends, completion_assign: HashSet::new(), completion_reset: HashSet::new(), for_init_text: None, classes: Vec::new(), next_home: None, hidden: false };
+        let mut c = Compiler { src, lines: Lines::from(src.text), alloc: &allocator, captured, used, class_depth: 0, module: Vec::new(), frames: Vec::new(), levels: Vec::new(), chains: Vec::new(), eval_fns, suspends, completion_assign: HashSet::new(), completion_reset: HashSet::new(), for_init_text: None, classes: Vec::new(), next_home: None, hidden: false, debug };
         let bound = names
             .iter()
             .map(|&(name, n)| match n {
@@ -531,12 +542,9 @@ impl Compiler<'_, '_> {
                 ModuleName::Import(i) => Bound { name, binding: Binding::Import(-1 - i32::from(i)), constant: true, ready: None, self_name: false },
             })
             .collect();
-        if suspend_count > 0 {
-            return Err(c.unsupported(program.span, "top-level await"));
-        }
-        c.levels.push(Level { func: usize::MAX, names: bound, context: Some(Register::current_context()), scope: None, dynamic: false, mark: 0, switch: false, cells: false });
-        c.module_body(program)?;
-        Ok((Module { functions: c.module }, info))
+        c.levels.push(Level { func: usize::MAX, names: bound, context: Some(Register::current_context()), scope: None, dynamic: false, mark: 0, switch: false, cells: false, locals: usize::MAX });
+        c.module_body(program, suspend_count)?;
+        Ok((Module { functions: c.module }, ModuleInfo { top_level_await: suspend_count > 0, ..info }))
     }
 
     fn module_layout<'a>(program: &'a Program<'a>) -> (Vec<(&'a str, ModuleName)>, ModuleInfo) {
@@ -767,8 +775,9 @@ impl<'a> Compiler<'a, '_> {
             None
         };
         let bindings: Vec<Binding> = names.iter().map(|n| n.binding).collect();
-        self.levels.push(Level { func, names, context, scope, dynamic: false, mark, switch: false, cells: false });
         let decls: Vec<&Decl<'a>> = decls.0.iter().filter(|d| !(matches!(d.kind, DeclKind::NewTarget | DeclKind::Arguments) && !self.used.contains(&d.key))).collect();
+        let locals = self.open_locals(&decls, &bindings);
+        self.levels.push(Level { func, names, context, scope, dynamic: false, mark, switch: false, cells: false, locals });
         for (d, &b) in decls.iter().zip(&bindings) {
             let skip = self.for_init_text.is_some_and(|t| !t.contains(d.name)) && matches!(b, Binding::Reg(_));
             if d.ready.is_some() && !skip {
@@ -825,7 +834,21 @@ impl<'a> Compiler<'a, '_> {
             self.b().pop_context(saved);
             self.frame().contexts.pop();
         }
+        self.b().close_locals(l.locals);
         self.b().release_to(l.mark);
+    }
+
+    fn open_locals(&mut self, decls: &[&Decl<'a>], bindings: &[Binding]) -> usize {
+        let first = self.b().locals_len();
+        if self.debug == DebugInfo::Omit {
+            return first;
+        }
+        for (d, b) in decls.iter().zip(bindings) {
+            if let (Binding::Reg(r), false) = (b, matches!(d.kind, DeclKind::This | DeclKind::NewTarget)) {
+                self.b().open_local(d.name, *r);
+            }
+        }
+        first
     }
 
     fn scoped(&mut self, decls: &Decls<'a>, f: impl FnOnce(&mut Self) -> Result<(), Error>) -> Result<(), Error> {
@@ -1110,15 +1133,7 @@ impl<'a> Compiler<'a, '_> {
                 }
                 c.function_body(body)
             }, |c, _| {
-                let g = c.frame().generator.expect("a generator register");
-                let args = c.b().new_register_list(2);
-                c.b().mov(g, args.first);
-                c.b().star(args.at(1));
-                c.b().load_the_hole();
-                c.b().plain(Bytecode::SetPendingMessage);
-                c.b().call_runtime(Runtime::InlineAsyncFunctionReject, args);
-                c.b().plain(Bytecode::Return);
-                c.release(args.first);
+                c.reject_async_function();
                 Ok(())
             })?;
         } else {
@@ -1127,8 +1142,20 @@ impl<'a> Compiler<'a, '_> {
         self.levels.pop();
         let f = self.frames.pop().expect("the function's frame");
         let at = f.index;
-        self.module[at] = f.finish();
+        self.module[at] = f.finish(&self.lines);
         Ok(u32::try_from(index).expect("fewer than 2^32 functions"))
+    }
+
+    fn reject_async_function(&mut self) {
+        let g = self.frame().generator.expect("a generator register");
+        let args = self.b().new_register_list(2);
+        self.b().mov(g, args.first);
+        self.b().star(args.at(1));
+        self.b().load_the_hole();
+        self.b().plain(Bytecode::SetPendingMessage);
+        self.b().call_runtime(Runtime::InlineAsyncFunctionReject, args);
+        self.b().plain(Bytecode::Return);
+        self.release(args.first);
     }
 
     fn function_body(&mut self, body: Body<'a>) -> Result<(), Error> {
@@ -2340,14 +2367,15 @@ impl<'a> Compiler<'a, '_> {
         self.plain_function(f, false, "")
     }
 
-    fn module_body(&mut self, program: &'a Program<'a>) -> Result<(), Error> {
-        use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind};
-        self.module.push(SharedFunction { name: "".into(), kind: FunctionKind::Module, strict: true, length: 0, formal_parameters: 0, scope: None, bytecode: j8bytecode::BytecodeArray::default() });
+    fn module_body(&mut self, program: &'a Program<'a>, suspends: u32) -> Result<(), Error> {
+        let asynchronous = suspends > 0;
+        let kind = if asynchronous { FunctionKind::AsyncFunction } else { FunctionKind::Module };
+        self.module.push(SharedFunction { name: "".into(), kind, strict: true, length: 0, formal_parameters: 0, scope: None, bytecode: j8bytecode::BytecodeArray::default() });
         self.frames.push(Frame {
             index: 0,
             b: Builder::new(1, 0),
             name: "".into(),
-            flavor: Flavor { strict: true, ..Flavor::default() },
+            flavor: Flavor { strict: true, asynchronous, ..Flavor::default() },
             default_constructor: false,
             length: 0,
             formals: 0,
@@ -2369,6 +2397,41 @@ impl<'a> Compiler<'a, '_> {
             prologue: false,
             simple_params: false,
         });
+        if !asynchronous {
+            self.module_statements(program)?;
+            self.b().load_undefined();
+            self.b().plain(Bytecode::Return);
+            self.finish_module();
+            return Ok(());
+        }
+        let g = self.temp();
+        self.b().new_target_or_generator = Some(g.0);
+        self.frame().generator = Some(g);
+        let mut table = self.b().jump_table(suspends, 0);
+        self.b().switch_on_generator_state(g, &mut table);
+        self.frame().resume_table = Some(table);
+        self.generator_object(Runtime::InlineAsyncFunctionEnter);
+        self.try_catch(j8bytecode::CatchPrediction::AsyncAwait, |c| {
+            c.module_statements(program)?;
+            c.b().load_undefined();
+            c.ret();
+            Ok(())
+        }, |c, _| {
+            c.reject_async_function();
+            Ok(())
+        })?;
+        self.finish_module();
+        Ok(())
+    }
+
+    fn finish_module(&mut self) {
+        let f = self.frames.pop().expect("the module's frame");
+        self.levels.clear();
+        self.module[0] = f.finish(&self.lines);
+    }
+
+    fn module_statements(&mut self, program: &'a Program<'a>) -> Result<(), Error> {
+        use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind};
         for s in &program.body {
             let (f, name, inferred) = match s {
                 Statement::FunctionDeclaration(f) => (f, f.id.as_ref().map(|i| i.name.as_str()), ""),
@@ -2416,11 +2479,6 @@ impl<'a> Compiler<'a, '_> {
                 s => self.statement(s)?,
             }
         }
-        self.b().load_undefined();
-        self.b().plain(Bytecode::Return);
-        let f = self.frames.pop().expect("the module's frame");
-        self.levels.clear();
-        self.module[0] = f.finish();
         Ok(())
     }
 
@@ -2543,7 +2601,7 @@ impl<'a> Compiler<'a, '_> {
                 self.frame().scope = Some(ScopeInfo { scope_type: Some(ScopeType::ScriptScope), variables, has_extension: false });
             }
             let mark = self.b().mark();
-            self.levels.push(Level { func: 0, names: lexical, context: None, scope: None, dynamic: false, mark, switch: false, cells: true });
+            self.levels.push(Level { func: 0, names: lexical, context: None, scope: None, dynamic: false, mark, switch: false, cells: true, locals: usize::MAX });
             if !declarations.is_empty() {
                 let k = self.constant(Constant::Declarations(declarations));
                 let args = self.b().new_register_list(2);
@@ -2564,7 +2622,7 @@ impl<'a> Compiler<'a, '_> {
         self.b().plain(Bytecode::Return);
         let f = self.frames.pop().expect("the script's frame");
         self.levels.clear();
-        self.module[0] = f.finish();
+        self.module[0] = f.finish(&self.lines);
         Ok(())
     }
 
@@ -2854,7 +2912,7 @@ impl<'a> Compiler<'a, '_> {
         self.b().push_context(saved);
         self.frame().contexts.push(saved);
         let names = alloc::vec![Bound { name, binding: Binding::Context(Context::MIN_SLOTS), constant: false, ready: None, self_name: false }];
-        self.levels.push(Level { func, names, context: Some(saved), scope: Some(k), dynamic: false, mark, switch: false, cells: false });
+        self.levels.push(Level { func, names, context: Some(saved), scope: Some(k), dynamic: false, mark, switch: false, cells: false, locals: usize::MAX });
         if matches!(p.pattern, BindingPattern::BindingIdentifier(_)) {
             self.block(&c.body)?;
         } else {
@@ -2879,6 +2937,11 @@ impl<'a> Compiler<'a, '_> {
 
     #[expect(clippy::too_many_lines, reason = "one arm per statement kind; splitting it would hurt readability")]
     fn statement(&mut self, s: &'a Statement<'a>) -> Result<(), Error> {
+        if self.debug == DebugInfo::Record {
+            self.b().at_statement(s.span().start);
+        } else {
+            self.b().at(s.span().start);
+        }
         if let Some(c) = self.frame().completion
             && self.completion_reset.contains(&s.span().start)
         {
@@ -2896,6 +2959,7 @@ impl<'a> Compiler<'a, '_> {
             Statement::VariableDeclaration(d) => self.declaration(d)?,
             Statement::FunctionDeclaration(f) => self.annexb_copy(f),
             Statement::EmptyStatement(_) => {}
+            Statement::DebuggerStatement(_) => self.b().plain(Bytecode::Debugger),
             Statement::ClassDeclaration(c) => {
                 self.class(c, "")?;
                 if let Some(id) = &c.id {
@@ -2918,6 +2982,7 @@ impl<'a> Compiler<'a, '_> {
             Statement::TryStatement(t) => self.try_statement(t)?,
             Statement::ThrowStatement(t) => {
                 self.expr(&t.argument)?;
+                self.b().at(t.span.start);
                 self.b().plain(Bytecode::Throw);
             }
             Statement::IfStatement(i) => {
@@ -3019,7 +3084,7 @@ impl<'a> Compiler<'a, '_> {
                 self.frame().contexts.push(saved);
                 let mark = self.b().mark();
                 let func = self.frames.len() - 1;
-                self.levels.push(Level { func, names: Vec::new(), context: Some(saved), scope: None, dynamic: true, mark, switch: false, cells: false });
+                self.levels.push(Level { func, names: Vec::new(), context: Some(saved), scope: None, dynamic: true, mark, switch: false, cells: false, locals: usize::MAX });
                 self.statement(&w.body)?;
                 self.leave();
                 self.release(object);

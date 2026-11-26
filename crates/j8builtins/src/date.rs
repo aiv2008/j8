@@ -1,5 +1,6 @@
 use j8framework::ValueKind;
 use alloc::format;
+use alloc::borrow::Cow;
 use alloc::string::String;
 
 use j8framework::{Scope, Error, ErrorKind, Hint, JsObject, ObjectKind, Property, Slot, Value};
@@ -23,7 +24,46 @@ const MONTH_START: [f64; 13] = [0.0, 31.0, 59.0, 90.0, 120.0, 151.0, 181.0, 212.
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-const TIME_ZONE: &str = "GMT+0000 (Coordinated Universal Time)";
+const UTC_NAME: &str = "Coordinated Universal Time";
+
+struct LocalZone {
+    #[cfg(feature = "intl")]
+    zone: crate::intl::Zone,
+}
+
+impl LocalZone {
+    #[cfg(feature = "intl")]
+    fn host(a: &Scope<'_, '_>) -> Self {
+        Self { zone: crate::intl::Zone::host(a.platform.time_zone()) }
+    }
+
+    #[cfg(not(feature = "intl"))]
+    fn host(_: &Scope<'_, '_>) -> Self {
+        Self {}
+    }
+
+    #[cfg(feature = "intl")]
+    fn offset(&self, t: f64) -> f64 {
+        f64::from(self.zone.offset_seconds(t)) * MS_PER_SECOND
+    }
+
+    #[cfg(not(feature = "intl"))]
+    #[expect(clippy::unused_self, reason = "the intl build reads the host zone through self")]
+    fn offset(&self, _: f64) -> f64 {
+        0.0
+    }
+
+    #[cfg(feature = "intl")]
+    fn name(&self, t: f64) -> Cow<'static, str> {
+        self.zone.abbreviation(t).map_or(Cow::Borrowed(UTC_NAME), Cow::Owned)
+    }
+
+    #[cfg(not(feature = "intl"))]
+    #[expect(clippy::unused_self, reason = "the intl build reads the host zone through self")]
+    fn name(&self, _: f64) -> Cow<'static, str> {
+        Cow::Borrowed(UTC_NAME)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -195,12 +235,46 @@ impl Dates {
         format!("{wd} {} {:02} {}", MONTHS[Self::slot(m) % 12], Self::int(d), Self::year_text(Self::year_from_time(t)))
     }
 
-    fn time_part(t: f64) -> String {
-        format!("{:02}:{:02}:{:02} {TIME_ZONE}", Self::int(Self::field(t, Field::Hours)), Self::int(Self::field(t, Field::Minutes)), Self::int(Self::field(t, Field::Seconds)))
+    fn time_part(local: f64, offset: f64, name: &str) -> String {
+        let minutes = Self::int(offset / MS_PER_MINUTE);
+        let sign = if minutes < 0 { '-' } else { '+' };
+        format!(
+            "{:02}:{:02}:{:02} GMT{sign}{:02}{:02} ({name})",
+            Self::int(Self::field(local, Field::Hours)),
+            Self::int(Self::field(local, Field::Minutes)),
+            Self::int(Self::field(local, Field::Seconds)),
+            minutes.abs() / 60,
+            minutes.abs() % 60,
+        )
     }
 
-    fn to_date_string_of(t: f64) -> String {
-        if t.is_nan() { String::from("Invalid Date") } else { format!("{} {}", Self::date_part(t), Self::time_part(t)) }
+    fn zoned_time_part(a: &Scope<'_, '_>, t: f64) -> String {
+        let zone = LocalZone::host(a);
+        let offset = zone.offset(t);
+        Self::time_part(t + offset, offset, &zone.name(t))
+    }
+
+    fn to_date_string_of(a: &Scope<'_, '_>, t: f64) -> String {
+        if t.is_nan() {
+            return String::from("Invalid Date");
+        }
+        let zone = LocalZone::host(a);
+        let offset = zone.offset(t);
+        let local = t + offset;
+        format!("{} {}", Self::date_part(local), Self::time_part(local, offset, &zone.name(t)))
+    }
+
+    fn local(a: &Scope<'_, '_>, t: f64) -> f64 {
+        t + LocalZone::host(a).offset(t)
+    }
+
+    fn utc(a: &Scope<'_, '_>, local: f64) -> f64 {
+        if !local.is_finite() {
+            return local;
+        }
+        let zone = LocalZone::host(a);
+        let guess = local - zone.offset(local);
+        local - zone.offset(guess)
     }
 
     fn utc_string(t: f64) -> String {
@@ -241,8 +315,12 @@ impl Dates {
         )
     }
 
-    fn parse(s: &str) -> f64 {
-        Self::parse_iso(s).or_else(|| Self::parse_text(s)).map_or(f64::NAN, Self::time_clip)
+    fn parse(a: &Scope<'_, '_>, s: &str) -> f64 {
+        match Self::parse_iso(s).or_else(|| Self::parse_text(s)) {
+            Some((t, true)) => Self::time_clip(t),
+            Some((t, false)) => Self::time_clip(Self::utc(a, t)),
+            None => f64::NAN,
+        }
     }
 
     fn digits(b: &[u8], at: &mut usize, n: usize) -> Option<f64> {
@@ -254,7 +332,7 @@ impl Dates {
         Some(part.iter().fold(0.0, |acc, &c| acc * 10.0 + f64::from(c - b'0')))
     }
 
-    fn parse_iso(s: &str) -> Option<f64> {
+    fn parse_iso(s: &str) -> Option<(f64, bool)> {
         let b = s.as_bytes();
         let mut i = 0;
         let year = match b.first()? {
@@ -291,7 +369,9 @@ impl Dates {
             return None;
         }
         let (mut h, mut mi_, mut sec, mut ms, mut offset) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut absolute = true;
         if i < b.len() {
+            absolute = false;
             if b[i] != b'T' {
                 return None;
             }
@@ -320,8 +400,12 @@ impl Dates {
                 }
             }
             match b.get(i) {
-                Some(b'Z') => i += 1,
+                Some(b'Z') => {
+                    i += 1;
+                    absolute = true;
+                }
                 Some(sign @ (b'+' | b'-')) => {
+                    absolute = true;
                     let neg = *sign == b'-';
                     i += 1;
                     let oh = Self::digits(b, &mut i, 2)?;
@@ -345,16 +429,17 @@ impl Dates {
             }
         }
         let t = Self::make_date(Self::make_day(year, month - 1.0, day), Self::make_time(h, mi_, sec, ms));
-        Some(t - offset)
+        Some((t - offset, absolute))
     }
 
-    fn parse_text(s: &str) -> Option<f64> {
+    fn parse_text(s: &str) -> Option<(f64, bool)> {
         let s = s.split('(').next()?.trim();
         let words: alloc::vec::Vec<&str> = s.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
         let mut month = None;
         let mut nums = alloc::vec::Vec::new();
         let mut time = None;
         let mut offset = 0.0;
+        let mut absolute = false;
         for w in words {
             if let Some(m) = MONTHS.iter().position(|m| w.len() >= 3 && m.eq_ignore_ascii_case(&w[..3])) {
                 #[expect(clippy::cast_precision_loss, reason = "month is less than 12")]
@@ -365,6 +450,7 @@ impl Dates {
                 let parts: alloc::vec::Vec<f64> = w.split(':').map(|p| p.parse::<f64>().ok()).collect::<Option<_>>()?;
                 time = Some(parts);
             } else if let Some(rest) = w.strip_prefix("GMT").or_else(|| w.strip_prefix("UTC")).or_else(|| w.strip_prefix('Z')) {
+                absolute = true;
                 if !rest.is_empty() {
                     let (neg, digits) = match rest.as_bytes()[0] {
                         b'+' => (false, &rest[1..]),
@@ -384,13 +470,13 @@ impl Dates {
         let (day, year) = if a > 31.0 { (b, a) } else { (a, b) };
         let t = time.unwrap_or_default();
         let (h, m, sec) = (t.first().copied().unwrap_or(0.0), t.get(1).copied().unwrap_or(0.0), t.get(2).copied().unwrap_or(0.0));
-        Some(Self::make_date(Self::make_day(year, month, day), Self::make_time(h, m, sec, 0.0)) - offset)
+        Some((Self::make_date(Self::make_day(year, month, day), Self::make_time(h, m, sec, 0.0)) - offset, absolute))
     }
 
     fn date<'scope>(a: &mut Scope<'scope, '_>, _: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let new_target = a.new_target;
         if new_target == Value::Undefined {
-            let s = Self::to_date_string_of(Self::now(a));
+            let s = Self::to_date_string_of(a, Self::now(a));
             return Ok(a.string(&s).into());
         }
         let tv = match args {
@@ -406,12 +492,15 @@ impl Dates {
                 match existing {
                     Some(t) => t,
                     None => match (a.to_primitive(*v, Hint::Default)?).kind() {
-                        ValueKind::String(s) => Self::parse(&s),
+                        ValueKind::String(s) => Self::parse(a, &s),
                         p => Self::time_clip(a.to_number(Value::from(p))?),
                     },
                 }
             }
-            _ => Self::time_clip(Self::from_parts(a, args)?),
+            _ => {
+                let local = Self::from_parts(a, args)?;
+                Self::time_clip(Self::utc(a, local))
+            }
         };
         Ok(a.create_from_ctor(new_target, a.context.date_proto, ObjectKind::Date(tv))?.into())
     }
@@ -434,7 +523,7 @@ impl Dates {
 
     fn date_parse<'scope>(a: &mut Scope<'scope, '_>, _: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let s = a.to_string(args.at(0))?;
-        Ok(Self::parse(&s).into())
+        Ok(Self::parse(a, &s).into())
     }
 
     fn date_utc<'scope>(a: &mut Scope<'scope, '_>, _: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
@@ -449,11 +538,12 @@ impl Dates {
         Ok(Self::time_clip(Self::make_date(Self::make_day(y, n[1], n[2]), Self::make_time(n[3], n[4], n[5], n[6]))).into())
     }
 
-    fn get<'scope, const F: u8>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+    fn get<'scope, const F: u8, const UTC: bool>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let (_, t) = Self::this_time(a, this)?;
         if t.is_nan() {
             return Ok(f64::NAN.into());
         }
+        let t = if UTC { t } else { Self::local(a, t) };
         let f = [Field::Year, Field::Month, Field::Date, Field::Day, Field::Hours, Field::Minutes, Field::Seconds, Field::Milliseconds][usize::from(F)];
         Ok(Self::field(t, f).into())
     }
@@ -464,12 +554,12 @@ impl Dates {
 
     fn get_timezone_offset<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let (_, t) = Self::this_time(a, this)?;
-        Ok(if t.is_nan() { f64::NAN } else { 0.0 }.into())
+        Ok(if t.is_nan() { f64::NAN } else { (t - Self::local(a, t)) / MS_PER_MINUTE }.into())
     }
 
     fn get_year<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let (_, t) = Self::this_time(a, this)?;
-        Ok(if t.is_nan() { f64::NAN } else { Self::year_from_time(t) - 1900.0 }.into())
+        Ok(if t.is_nan() { f64::NAN } else { Self::year_from_time(Self::local(a, t)) - 1900.0 }.into())
     }
 
     fn store<'scope>(a: &Scope<'scope, '_>, o: JsObject<'scope>, t: f64) -> Value<'scope> {
@@ -484,7 +574,7 @@ impl Dates {
         Ok(Self::store(a, o, t))
     }
 
-    fn set<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>], which: Setter) -> Result<Value<'scope>, Error> {
+    fn set<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>], which: Setter, utc: bool) -> Result<Value<'scope>, Error> {
         let (o, t) = Self::this_time(a, this)?;
         let count = match which {
             Setter::Milliseconds | Setter::Date => 1,
@@ -503,7 +593,8 @@ impl Dates {
         let t = match (t.is_nan(), which) {
             (true, Setter::FullYear) => 0.0,
             (true, _) => return Ok(f64::NAN.into()),
-            (false, _) => t,
+            (false, _) if utc => t,
+            (false, _) => Self::local(a, t),
         };
         let pick = |i: usize, f: Field| if i < present { given[i] } else { Self::field(t, f) };
         let (y, m) = (Self::field(t, Field::Year), Self::field(t, Field::Month));
@@ -519,6 +610,7 @@ impl Dates {
             Setter::Month => Self::make_date(Self::make_day(y, given[0], pick(1, Field::Date)), within),
             Setter::FullYear => Self::make_date(Self::make_day(given[0], pick(1, Field::Month), pick(2, Field::Date)), within),
         };
+        let nt = if utc { nt } else { Self::utc(a, nt) };
         Ok(Self::store(a, o, nt))
     }
 
@@ -528,15 +620,16 @@ impl Dates {
         if y.is_nan() {
             return Ok(Self::store(a, o, f64::NAN));
         }
-        let t = if t.is_nan() { 0.0 } else { t };
+        let t = if t.is_nan() { 0.0 } else { Self::local(a, t) };
         let yyyy = Self::full_year(y);
         let d = Self::make_day(yyyy, Self::field(t, Field::Month), Self::field(t, Field::Date));
-        Ok(Self::store(a, o, Self::make_date(d, modulo(t, MS_PER_DAY))))
+        let local = Self::make_date(d, modulo(t, MS_PER_DAY));
+        Ok(Self::store(a, o, Self::utc(a, local)))
     }
 
-    fn text<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, f: fn(f64) -> String) -> Result<Value<'scope>, Error> {
+    fn text<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, f: fn(&Scope<'_, '_>, f64) -> String) -> Result<Value<'scope>, Error> {
         let (_, t) = Self::this_time(a, this)?;
-        let s = if t.is_nan() { String::from("Invalid Date") } else { f(t) };
+        let s = if t.is_nan() { String::from("Invalid Date") } else { f(a, t) };
         Ok(a.string(&s).into())
     }
 
@@ -545,15 +638,21 @@ impl Dates {
     }
 
     fn to_date_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-        Self::text(a, this, Self::date_part)
+        Self::text(a, this, |a, t| Self::date_part(Self::local(a, t)))
     }
 
+    locale_method!(to_locale_string, crate::intl::DateTimeFormats::to_locale_string, Self::to_string);
+
+    locale_method!(to_locale_date_string, crate::intl::DateTimeFormats::to_locale_date_string, Self::to_date_string);
+
+    locale_method!(to_locale_time_string, crate::intl::DateTimeFormats::to_locale_time_string, Self::to_time_string);
+
     fn to_time_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-        Self::text(a, this, Self::time_part)
+        Self::text(a, this, Self::zoned_time_part)
     }
 
     fn to_utc_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-        Self::text(a, this, Self::utc_string)
+        Self::text(a, this, |_, t| Self::utc_string(t))
     }
 
     fn to_iso_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
@@ -605,24 +704,56 @@ impl Dates {
     }
 }
 
+#[cfg(feature = "intl")]
+pub(crate) struct Civil {
+    pub(crate) year: i32,
+    pub(crate) month: u8,
+    pub(crate) day: u8,
+    pub(crate) hour: u8,
+    pub(crate) minute: u8,
+    pub(crate) second: u8,
+    pub(crate) millisecond: u16,
+}
+
+#[cfg(feature = "intl")]
+impl From<f64> for Civil {
+    fn from(t: f64) -> Self {
+        let small = |f: Field| u8::try_from(Dates::int(Dates::field(t, f))).unwrap_or(0);
+        let (m, d) = Dates::month_and_date(t);
+        Self {
+            year: i32::try_from(Dates::int(Dates::year_from_time(t))).unwrap_or(0),
+            month: u8::try_from(Dates::int(m) + 1).unwrap_or(1),
+            day: u8::try_from(Dates::int(d)).unwrap_or(1),
+            hour: small(Field::Hours),
+            minute: small(Field::Minutes),
+            second: small(Field::Seconds),
+            millisecond: u16::try_from(Dates::int(Dates::field(t, Field::Milliseconds))).unwrap_or(0),
+        }
+    }
+}
+
 macro_rules! setters {
-    ($($name:ident => $which:ident),* $(,)?) => {
+    ($($name:ident, $utc:ident => $which:ident),* $(,)?) => {
         impl Dates {
             $(fn $name<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-                Self::set(a, this, args, Setter::$which)
+                Self::set(a, this, args, Setter::$which, false)
+            }
+
+            fn $utc<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+                Self::set(a, this, args, Setter::$which, true)
             })*
         }
     };
 }
 
 setters! {
-    set_milliseconds => Milliseconds,
-    set_seconds => Seconds,
-    set_minutes => Minutes,
-    set_hours => Hours,
-    set_date => Date,
-    set_month => Month,
-    set_full_year => FullYear,
+    set_milliseconds, set_utc_milliseconds => Milliseconds,
+    set_seconds, set_utc_seconds => Seconds,
+    set_minutes, set_utc_minutes => Minutes,
+    set_hours, set_utc_hours => Hours,
+    set_date, set_utc_date => Date,
+    set_month, set_utc_month => Month,
+    set_full_year, set_utc_full_year => FullYear,
 }
 
 impl Installer<'_, '_> {
@@ -633,32 +764,32 @@ impl Installer<'_, '_> {
         self.method(ctor, "now", Dates::date_now, 0);
         self.method(ctor, "parse", Dates::date_parse, 1);
         self.method(ctor, "UTC", Dates::date_utc, 7);
-        let getters: [(&str, j8framework::NativeFn); 8] = [
-            ("FullYear", Dates::get::<0>),
-            ("Month", Dates::get::<1>),
-            ("Date", Dates::get::<2>),
-            ("Day", Dates::get::<3>),
-            ("Hours", Dates::get::<4>),
-            ("Minutes", Dates::get::<5>),
-            ("Seconds", Dates::get::<6>),
-            ("Milliseconds", Dates::get::<7>),
+        let getters: [(&str, j8framework::NativeFn, j8framework::NativeFn); 8] = [
+            ("FullYear", Dates::get::<0, false>, Dates::get::<0, true>),
+            ("Month", Dates::get::<1, false>, Dates::get::<1, true>),
+            ("Date", Dates::get::<2, false>, Dates::get::<2, true>),
+            ("Day", Dates::get::<3, false>, Dates::get::<3, true>),
+            ("Hours", Dates::get::<4, false>, Dates::get::<4, true>),
+            ("Minutes", Dates::get::<5, false>, Dates::get::<5, true>),
+            ("Seconds", Dates::get::<6, false>, Dates::get::<6, true>),
+            ("Milliseconds", Dates::get::<7, false>, Dates::get::<7, true>),
         ];
-        for (name, f) in getters {
-            self.method(proto, &alloc::format!("get{name}"), f, 0);
-            self.method(proto, &alloc::format!("getUTC{name}"), f, 0);
+        for (name, local, utc) in getters {
+            self.method(proto, &alloc::format!("get{name}"), local, 0);
+            self.method(proto, &alloc::format!("getUTC{name}"), utc, 0);
         }
-        let setters: [(&str, j8framework::NativeFn, u32); 7] = [
-            ("Milliseconds", Dates::set_milliseconds, 1),
-            ("Seconds", Dates::set_seconds, 2),
-            ("Minutes", Dates::set_minutes, 3),
-            ("Hours", Dates::set_hours, 4),
-            ("Date", Dates::set_date, 1),
-            ("Month", Dates::set_month, 2),
-            ("FullYear", Dates::set_full_year, 3),
+        let setters: [(&str, j8framework::NativeFn, j8framework::NativeFn, u32); 7] = [
+            ("Milliseconds", Dates::set_milliseconds, Dates::set_utc_milliseconds, 1),
+            ("Seconds", Dates::set_seconds, Dates::set_utc_seconds, 2),
+            ("Minutes", Dates::set_minutes, Dates::set_utc_minutes, 3),
+            ("Hours", Dates::set_hours, Dates::set_utc_hours, 4),
+            ("Date", Dates::set_date, Dates::set_utc_date, 1),
+            ("Month", Dates::set_month, Dates::set_utc_month, 2),
+            ("FullYear", Dates::set_full_year, Dates::set_utc_full_year, 3),
         ];
-        for (name, f, n) in setters {
-            self.method(proto, &alloc::format!("set{name}"), f, n);
-            self.method(proto, &alloc::format!("setUTC{name}"), f, n);
+        for (name, local, utc, n) in setters {
+            self.method(proto, &alloc::format!("set{name}"), local, n);
+            self.method(proto, &alloc::format!("setUTC{name}"), utc, n);
         }
         let methods: [(&str, j8framework::NativeFn, u32); 15] = [
             ("getTime", Dates::get_time, 0),
@@ -672,9 +803,9 @@ impl Installer<'_, '_> {
             ("toISOString", Dates::to_iso_string, 0),
             ("toUTCString", Dates::to_utc_string, 0),
             ("toJSON", Dates::to_json, 1),
-            ("toLocaleString", Dates::to_string, 0),
-            ("toLocaleDateString", Dates::to_date_string, 0),
-            ("toLocaleTimeString", Dates::to_time_string, 0),
+            ("toLocaleString", Dates::to_locale_string, 0),
+            ("toLocaleDateString", Dates::to_locale_date_string, 0),
+            ("toLocaleTimeString", Dates::to_locale_time_string, 0),
             ("valueOf", Dates::value_of, 0),
         ];
         for (name, f, n) in methods {

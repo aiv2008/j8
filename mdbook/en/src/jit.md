@@ -112,7 +112,8 @@ Ctx  +0 budget  +8 pending  +16 global  +24 script scope  +32 Object.prototype  
 ```
 
 - `j8_helper`: slow-path runtime functions (property access, allocation, generic operators);
-- `j8_poll`: loops check the budget and termination requests, so machine code can be interrupted like the interpreter;
+- `j8_poll`: loops check the budget, termination and interrupt requests; a set request deoptimizes at the check and
+  the interpreter handles it, so machine code can be interrupted like the interpreter;
 - `j8_deopt`: the deoptimization entry;
 - executable memory comes from `mmap` on Unix and `VirtualAlloc` on Windows.
 

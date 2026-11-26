@@ -541,16 +541,14 @@ impl Jit {
         let params = e.params();
         let words: [u64; 4] = core::array::from_fn(|i| if i <= e.function().shared().formal_parameters as usize { unsafe { (*params.add(i)).bits() } } else { j8framework::ValueBits::UNDEFINED });
         let callee = e.callee().bits();
-        let level = e.depth();
-        let exe = e.executor();
-        let saved = exe.jit_depth().replace(level);
+        let depth = e.executor().at_depth(e.depth());
         let mut ctx = Ctx::new(e, self);
         type NativeFn = sysv!(unsafe fn(*mut Ctx, u64, u64, u64, u64, u64) -> u64);
         let r = unsafe {
             let f: NativeFn = core::mem::transmute::<usize, NativeFn>(addr);
             f(&raw mut *ctx, callee, words[0], words[1], words[2], words[3])
         };
-        exe.jit_depth().set(saved);
+        drop(depth);
         let threw = (ctx.pending != 0).then(|| ctx.error.take().unwrap_or(j8framework::Error::Terminated));
         self.recycle(ctx);
         if let Some(err) = threw {
@@ -563,15 +561,13 @@ impl Jit {
     fn run(&self, e: &mut Entry<'_, '_, '_, '_, '_>, addr: usize) -> Tiered {
         let params = e.params().cast::<Value<'static>>();
         let r0 = e.r0().cast::<Value<'static>>();
-        let level = e.depth();
-        let exe = e.executor();
-        let saved = exe.jit_depth().replace(level);
+        let depth = e.executor().at_depth(e.depth());
         let mut ctx = Ctx::new(e, self);
         let status = unsafe {
             let f: EntryFn = core::mem::transmute::<usize, EntryFn>(addr);
             f(&raw mut *ctx, params, r0)
         };
-        exe.jit_depth().set(saved);
+        drop(depth);
         let r = match status {
             RETURNED => {
                 let v = unsafe { Value::from_bits(ctx.ret) };

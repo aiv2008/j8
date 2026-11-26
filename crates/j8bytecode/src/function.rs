@@ -155,15 +155,53 @@ pub enum CatchPrediction {
     UncaughtAsyncAwait,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourcePosition {
+    pub offset: u32,
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalVariable {
+    pub name: Box<str>,
+    pub register: i32,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugTable {
+    pub statements: Vec<SourcePosition>,
+    pub locals: Vec<LocalVariable>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BytecodeArray {
     pub code: Box<[u8]>,
     pub constants: Vec<Constant>,
     pub handlers: Vec<HandlerEntry>,
+    pub positions: Vec<SourcePosition>,
+    pub debug: Option<Box<DebugTable>>,
     pub parameter_count: u16,
     pub register_count: u32,
     pub feedback: Vec<FeedbackSlotKind>,
     pub new_target_or_generator: Option<i32>,
+}
+
+impl BytecodeArray {
+    pub fn position_at(&self, offset: u32) -> Option<SourcePosition> {
+        let i = self.positions.partition_point(|p| p.offset <= offset);
+        i.checked_sub(1).map(|i| self.positions[i])
+    }
+
+    pub fn statements(&self) -> &[SourcePosition] {
+        self.debug.as_ref().map_or(&[], |d| &d.statements)
+    }
+
+    pub fn locals_at(&self, offset: u32) -> impl Iterator<Item = &LocalVariable> {
+        self.debug.iter().flat_map(|d| &d.locals).filter(move |l| (l.start..l.end).contains(&offset))
+    }
 }
 
 #[derive(Clone, Debug)]

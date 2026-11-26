@@ -71,6 +71,7 @@ pub struct Context<'scope> {
     pub async_from_sync_iterator_proto: JsObject<'scope>,
     pub promise_proto: JsObject<'scope>,
     pub promise_ctor: JsObject<'scope>,
+    pub error_ctor: JsObject<'scope>,
     pub regexp_proto: JsObject<'scope>,
     pub regexp_ctor: JsObject<'scope>,
     pub eval: JsObject<'scope>,
@@ -100,6 +101,7 @@ pub struct Context<'scope> {
     pub symbol_registry: Cow<'scope, alloc::vec::Vec<(JsString<'scope>, JsSymbol<'scope>)>>,
     pub random_state: AtomicU64,
     pub jobs: GcQueue<'scope, Job<'scope>>,
+    pub rejections: GcQueue<'scope, JsObject<'scope>>,
     pub templates: Cow<'scope, alloc::collections::BTreeMap<(u32, u32), JsObject<'scope>>>,
     pub string_constants: Cow<'scope, alloc::collections::BTreeMap<(u32, u32), JsString<'scope>>>,
     pub script_contexts: Cow<'scope, Vec<crate::JsEnv<'scope>>>,
@@ -110,6 +112,7 @@ pub struct Context<'scope> {
     pub fast_builtins: Cow<'scope, crate::Static<FastTable>>,
     pub builtin_nexts: Cow<'scope, [Option<JsObject<'scope>>; 2]>,
     pub indexed_cache: AtomicU64,
+    pub async_evaluation_order: AtomicU64,
 }
 
 #[derive(Clone, Collect)]
@@ -273,6 +276,7 @@ impl<'scope> Context<'scope> {
             async_from_sync_iterator_proto: derived(async_iterator_proto),
             promise_proto: derived(object_proto),
             promise_ctor: placeholder(function_proto),
+            error_ctor: placeholder(function_proto),
             regexp_proto: derived(object_proto),
             regexp_ctor: ObjectData { kind: ObjectKind::Native(Native::function(Self::no_regexp)), ..ObjectData::default() }.alloc(mc),
             eval: ObjectData { kind: ObjectKind::Native(Native::function(Self::no_eval)), proto: Some(function_proto), ..ObjectData::default() }.alloc(mc),
@@ -302,6 +306,7 @@ impl<'scope> Context<'scope> {
                 split: symbol("split"),
             },
             jobs: GcQueue::new(mc),
+            rejections: GcQueue::new(mc),
             regexp_cache: core::array::from_fn(|_| Slot::default()),
             regexp_literals: core::array::from_fn(|_| Slot::default()),
             regexp_pristine: Cow::new(mc, None),
@@ -309,6 +314,7 @@ impl<'scope> Context<'scope> {
             fast_builtins: Cow::new(mc, crate::Static(FastTable::default())),
             builtin_nexts: Cow::new(mc, [None, None]),
             indexed_cache: AtomicU64::new(0),
+            async_evaluation_order: AtomicU64::new(0),
             symbol_registry: Cow::new(mc, alloc::vec::Vec::new()),
             modules: Cow::new(mc, alloc::vec::Vec::new()),
             random_state: AtomicU64::new(0),

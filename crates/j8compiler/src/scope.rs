@@ -147,6 +147,16 @@ impl<'a> Decls<'a> {
             }
             Statement::LabeledStatement(l) => self.var_in(&l.body),
             Statement::SwitchStatement(sw) => sw.cases.iter().for_each(|c| self.vars(&c.consequent)),
+            Statement::TryStatement(t) => {
+                self.vars(&t.block.body);
+                if let Some(h) = &t.handler {
+                    self.vars(&h.body.body);
+                }
+                if let Some(f) = &t.finalizer {
+                    self.vars(&f.body);
+                }
+            }
+            Statement::WithStatement(w) => self.var_in(&w.body),
             _ => {}
         }
     }

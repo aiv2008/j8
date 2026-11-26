@@ -25,7 +25,7 @@ J8_TEST262_UPDATE=1 cargo test --release --test test262 -- <路径>             
 
 | 测试 | 内容 |
 |---|---|
-| `tests/runtime.rs`、`tests/event_loop.rs`、`tests/terminate.rs` | 运行时、事件循环、中止执行 |
+| `tests/runtime.rs`、`tests/event_loop.rs`、`tests/terminate.rs`、`tests/interrupt.rs`、`tests/heap_limit.rs` | 运行时、事件循环、中止执行、中断、堆上限 |
 | `tests/binding.rs`、`tests/bindings_more.rs` | 绑定宏 |
 | `crates/j8bytecode/tests/v8.rs` | 解码 V8 打印的 738 条指令，逐条核对 |
 | `crates/j8executor` 的 `javascript_semantics` | 逐条确定的 JS 语义表 |

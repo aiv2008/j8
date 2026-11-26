@@ -43,7 +43,7 @@ version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
@@ -56,6 +56,12 @@ dependencies = [
  "shlex",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
@@ -112,6 +118,16 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "clear-cache"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2a99cd4270644c07e6102f3080aa70a0328c1a5703890f710536b302cdec524"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -218,6 +234,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "either"
@@ -440,9 +462,7 @@ checksum = "4754a1731458af0443709c9667302793d3f63cc90ec4ba4c8259f2b9515478e5"
 
 [[package]]
 name = "j8"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56c20709c494f92103b3b7c2fa2e2fadac3d78b871d94179f16b0d819a0132bc"
+version = "0.5.1"
 dependencies = [
  "j8binding",
  "j8builtins",
@@ -458,9 +478,7 @@ dependencies = [
 
 [[package]]
 name = "j8binding"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c3df70c63a24714404f3b0a6e4d73ecca4c37c9a54a0986a51046cddf9a59b2"
+version = "0.5.1"
 dependencies = [
  "j8framework",
  "j8lockfree",
@@ -468,14 +486,13 @@ dependencies = [
 
 [[package]]
 name = "j8builtins"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361fcf228d8ebdf31cbda42b1b4dfc41de0fe76f09f24f04b3fca94711a217e4"
+version = "0.5.1"
 dependencies = [
  "j8framework",
  "libm",
  "num-bigint 0.4.8",
  "num-traits",
+ "regex",
  "regress",
  "ryu-js",
  "unicode-normalization",
@@ -483,18 +500,14 @@ dependencies = [
 
 [[package]]
 name = "j8bytecode"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e416819ff4b863625a5db21e5037ff55cc2b6f78da8e04bf2e786bffcacad4"
+version = "0.5.1"
 dependencies = [
  "j8macros",
 ]
 
 [[package]]
 name = "j8compiler"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "637ad286f83315e4988af62f3af11694d55f612508744b7c57b4cd5a2e7bed05"
+version = "0.5.1"
 dependencies = [
  "j8bytecode",
  "j8framework",
@@ -503,31 +516,28 @@ dependencies = [
  "oxc_parser",
  "oxc_semantic",
  "oxc_span",
+ "oxc_str",
  "oxc_syntax",
  "ryu-js",
 ]
 
 [[package]]
 name = "j8executor"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c8f260419f756f7f05e983005058b90b175156acdd0dbc64df8974b7623ae13"
+version = "0.5.1"
 dependencies = [
  "j8bytecode",
  "j8compiler",
  "j8framework",
  "j8lockfree",
+ "j8taskqueue",
  "ryu-js",
 ]
 
 [[package]]
 name = "j8framework"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "467418e184e09182129c064b32472549db334922f3bf8985b54dfc908c472e2a"
+version = "0.5.1"
 dependencies = [
  "hashbrown",
- "j8bytecode",
  "j8lockfree",
  "j8macros",
  "j8taskqueue",
@@ -537,33 +547,29 @@ dependencies = [
  "paragc",
  "rustc-hash",
  "ryu-js",
- "smol_str",
 ]
 
 [[package]]
 name = "j8jit"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7d89ccd804b331793178f362e5e15e00850d05ac2c9ae9c1af80c12705096a8"
+version = "0.5.1"
 dependencies = [
+ "clear-cache",
  "j8bytecode",
  "j8executor",
  "j8framework",
  "libc",
  "mlirpass",
+ "moremath",
+ "region",
 ]
 
 [[package]]
 name = "j8lockfree"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35498a2711ef5e325caa613de737bc1b924f23b1c8db2ccdbe656e6a7a1c833d"
+version = "0.5.1"
 
 [[package]]
 name = "j8macros"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd82cf3ea59c45d4cd4bc6cac53b324e23a5c86951f713df398528f4178f9279"
+version = "0.5.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -574,19 +580,16 @@ dependencies = [
 
 [[package]]
 name = "j8platform"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70368c164e694a89d49932110b5c687034a9c4eda975b23a6017ebb8a880021f"
+version = "0.5.1"
 dependencies = [
+ "dunce",
  "j8framework",
  "moremath",
 ]
 
 [[package]]
 name = "j8taskqueue"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8415df21c4b79cd8b51b9cb3ff835f4b91b80b19168740c235a60bc43325ed85"
+version = "0.5.1"
 dependencies = [
  "j8lockfree",
 ]
@@ -632,6 +635,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -654,9 +666,9 @@ dependencies = [
 
 [[package]]
 name = "mlirformat"
-version = "0.8.9"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d3580014dafcef174f3f839f7a3a3de816bc95708097ff0a6f7adcdf4f2e77"
+checksum = "32f769f63eb872a950159a5e2769a8b9fc1ab46c3e745371d25eaeba3e2da9ce"
 dependencies = [
  "mlirformat-macros",
  "moremath",
@@ -667,9 +679,9 @@ dependencies = [
 
 [[package]]
 name = "mlirformat-macros"
-version = "0.8.9"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22efe4ab89dc33a2c174c39ff785c3f0e6c97cd42ad5b581166fe7eb8556d4ac"
+checksum = "82f5f571fe71c9447f5ae610cecfa588cff2282f982f43ce249218babf06c911"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -678,9 +690,9 @@ dependencies = [
 
 [[package]]
 name = "mlirpass"
-version = "0.10.4"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4deaf752b92a68669599eb7dc476ba9c5a8097cf621352a60802e3d7978f00b"
+checksum = "da4cc1aff7cc4eda887027f47e4997c6733e1a378ea34bc5084da1e552d12d7d"
 dependencies = [
  "libm",
  "mlirformat",
@@ -795,7 +807,7 @@ version = "0.158.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01a1cff5a82c7f5480d1103288072df539da8ca8aa3d9acb29f5381c45799420"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "oxc_allocator",
  "oxc_ast_macros",
  "oxc_data_structures",
@@ -895,7 +907,7 @@ version = "0.158.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7abfa2897dd082cd208a089692dd40e2e00166015de6993398689025ce8ea0ed"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "cow-utils",
  "memchr",
  "num-bigint 0.5.1",
@@ -919,7 +931,7 @@ version = "0.158.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a4569041514ee03f1043609b07e36e383a9653aa38ee70171709eea64081c6c"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "oxc_allocator",
  "oxc_ast_macros",
  "oxc_diagnostics",
@@ -985,7 +997,7 @@ version = "0.158.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e23801ef775d1cd5743d7abd9d88f826ec4408b85a715bede0526228d688b372"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "cow-utils",
  "nonmax",
  "oxc_allocator",
@@ -1001,9 +1013,9 @@ dependencies = [
 
 [[package]]
 name = "paragc"
-version = "0.5.0"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a6fe966f014e4b6e6cf635b3e439d7b33e6958111458b3443d1ca73f213a978"
+checksum = "83cdbc306f93e391300ac3c861cf21d8b1528a75b816fd37a2d0d9a5a9570264"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
@@ -1013,9 +1025,9 @@ dependencies = [
 
 [[package]]
 name = "paragc-macros"
-version = "0.5.0"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "367fa4040c8aa746a1ff38ffb4009eaa6db6ae84851fdefc9608af94d080974f"
+checksum = "6a13fcc8e39ee59fff7904ffc8c279a1dde7ca5b889b1d6466089c9bbcfaba5e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1146,6 +1158,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "region"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6b6ebd13bc009aef9cd476c1310d49ac354d36e240cf1bd753290f3dc7199a7"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+ "mach2",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "regress"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1177,7 +1201,7 @@ version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -1277,12 +1301,6 @@ name = "smawk"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
-
-[[package]]
-name = "smol_str"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eeb7109d23f319619d4cc0de5464613c8b7b1a09db2774a58101459cf6be2f10"
 
 [[package]]
 name = "stable_deref_trait"
@@ -1487,7 +1505,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a10fe1a92da5c32c7c7f838ce36c0ccfcfd5edf0865b58bdde820aa64cea9888"
 dependencies = [
  "bindgen",
- "bitflags",
+ "bitflags 2.13.2",
  "fslock",
  "gzip-header",
  "home",
@@ -1536,6 +1554,15 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
 
 [[package]]
 name = "windows-sys"

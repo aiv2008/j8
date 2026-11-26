@@ -213,6 +213,7 @@ impl<'a> Compiler<'a, '_> {
                 self.expr(&n.callee)?;
                 self.b().star(callee);
                 let (args, spread) = self.argument_list(&n.arguments, None)?;
+                self.b().at(n.span.start);
                 match spread {
                     Spread::Array => self.reflect(NativeContextIndex::ReflectConstruct, &[callee, args.first]),
                     Spread::Last => {
@@ -864,6 +865,7 @@ impl<'a> Compiler<'a, '_> {
                 self.expr(&m.object)?;
                 self.b().star(r);
                 self.optional(m.optional, m.span)?;
+                self.b().at(m.property.span.start);
                 self.b().get_named(r, m.property.name.as_str());
                 Some(r)
             }
@@ -873,6 +875,7 @@ impl<'a> Compiler<'a, '_> {
                 self.b().star(r);
                 self.optional(m.optional, m.span)?;
                 self.expr(&m.expression)?;
+                self.b().at(m.expression.span().start);
                 self.b().get_keyed(r);
                 Some(r)
             }
@@ -933,6 +936,7 @@ impl<'a> Compiler<'a, '_> {
         if eval {
             self.resolve_possibly_direct_eval(callee, args, c.span);
         }
+        self.b().at(Self::call_position(&c.callee));
         match (receiver, spread) {
             (_, Spread::Array) => {
                 let this = match receiver {
@@ -960,6 +964,15 @@ impl<'a> Compiler<'a, '_> {
         }
         self.release(callee);
         Ok(())
+    }
+
+    fn call_position(callee: &Expression<'_>) -> u32 {
+        match callee {
+            Expression::StaticMemberExpression(m) => m.property.span.start,
+            Expression::ComputedMemberExpression(m) => m.span.end,
+            Expression::PrivateFieldExpression(p) => p.field.span.start,
+            e => e.span().start,
+        }
     }
 
     fn reflect(&mut self, f: NativeContextIndex, operands: &[Register]) {
@@ -1006,6 +1019,7 @@ impl<'a> Compiler<'a, '_> {
         if !m.optional
             && let Some(obj) = self.in_register(&m.object)
         {
+            self.b().at(m.property.span.start);
             self.b().get_named(obj, m.property.name.as_str());
             return Ok(());
         }
@@ -1013,6 +1027,7 @@ impl<'a> Compiler<'a, '_> {
         self.optional(m.optional, m.span)?;
         let obj = self.temp();
         self.b().star(obj);
+        self.b().at(m.property.span.start);
         self.b().get_named(obj, m.property.name.as_str());
         self.release(obj);
         Ok(())
@@ -1024,6 +1039,7 @@ impl<'a> Compiler<'a, '_> {
             && let Some(obj) = self.in_register(&m.object)
         {
             self.expr(&m.expression)?;
+            self.b().at(m.expression.span().start);
             self.b().get_keyed(obj);
             return Ok(());
         }
@@ -1032,6 +1048,7 @@ impl<'a> Compiler<'a, '_> {
         let obj = self.temp();
         self.b().star(obj);
         self.expr(&m.expression)?;
+        self.b().at(m.expression.span().start);
         self.b().get_keyed(obj);
         self.release(obj);
         Ok(())

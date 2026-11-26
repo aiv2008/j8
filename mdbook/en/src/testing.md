@@ -29,7 +29,7 @@ function compiled on its first call, for the widest coverage).
 
 | Test | Covers |
 |---|---|
-| `tests/runtime.rs`, `tests/event_loop.rs`, `tests/terminate.rs` | runtimes, event loops, termination |
+| `tests/runtime.rs`, `tests/event_loop.rs`, `tests/terminate.rs`, `tests/interrupt.rs`, `tests/heap_limit.rs` | runtimes, event loops, termination, interrupts, the heap limit |
 | `tests/binding.rs`, `tests/bindings_more.rs` | the binding macros |
 | `crates/j8bytecode/tests/v8.rs` | decodes 738 instructions V8 printed, checking each |
 | `javascript_semantics` in `crates/j8executor` | a table of exactly determined JS semantics |

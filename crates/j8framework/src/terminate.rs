@@ -5,37 +5,59 @@ use core::sync::atomic::{AtomicU8, Ordering};
 #[repr(transparent)]
 pub struct Termination(AtomicU8);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum State {
-    Idle = 0,
-    Requested = 1,
-    Unwinding = 2,
-}
+const REQUESTED: u8 = 1;
+const UNWINDING: u8 = 2;
+const TERMINATE: u8 = REQUESTED | UNWINDING;
+const INTERRUPT: u8 = 4;
+const COLLECT: u8 = 8;
 
 impl Termination {
     pub fn request(&self) {
-        let _ = self.0.compare_exchange(State::Idle as u8, State::Requested as u8, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| (s & TERMINATE == 0).then_some(s | REQUESTED));
     }
 
     pub fn cancel(&self) {
-        self.0.store(State::Idle as u8, Ordering::SeqCst);
+        self.0.fetch_and(!TERMINATE, Ordering::SeqCst);
     }
 
     pub fn is_set(&self) -> bool {
-        self.0.load(Ordering::Relaxed) != State::Idle as u8
+        self.0.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn is_terminating(&self) -> bool {
+        self.0.load(Ordering::Relaxed) & TERMINATE != 0
     }
 
     pub fn observe(&self) -> bool {
         if !self.is_set() {
             return false;
         }
-        let _ = self.0.compare_exchange(State::Requested as u8, State::Unwinding as u8, Ordering::SeqCst, Ordering::SeqCst);
-        true
+        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| (s & TERMINATE == REQUESTED).then_some(s & !TERMINATE | UNWINDING));
+        self.is_terminating()
     }
 
     pub fn finish(&self) {
-        let _ = self.0.compare_exchange(State::Unwinding as u8, State::Idle as u8, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| (s & TERMINATE == UNWINDING).then_some(s & !TERMINATE));
+    }
+
+    pub fn interrupt(&self) {
+        self.0.fetch_or(INTERRUPT, Ordering::SeqCst);
+    }
+
+    pub fn has_interrupt(&self) -> bool {
+        self.0.load(Ordering::Relaxed) & INTERRUPT != 0
+    }
+
+    pub fn take_interrupt(&self) -> bool {
+        self.0.fetch_and(!INTERRUPT, Ordering::SeqCst) & INTERRUPT != 0
+    }
+
+    pub fn request_collect(&self) {
+        self.0.fetch_or(COLLECT, Ordering::SeqCst);
+    }
+
+    pub fn take_collect(&self) -> bool {
+        self.0.fetch_and(!COLLECT, Ordering::SeqCst) & COLLECT != 0
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -56,6 +78,6 @@ impl IsolateHandle {
     }
 
     pub fn is_terminating(&self) -> bool {
-        self.0.is_set()
+        self.0.is_terminating()
     }
 }

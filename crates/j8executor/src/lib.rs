@@ -6,6 +6,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+use core::ptr::NonNull;
 
 use j8bytecode::{Bytecode, Constant, Context, Decoded, FunctionKind, Intrinsic, LiteralValue, Module, NativeContextIndex, Operands, OperandValue, Register, Runtime, ScopeInfo, ScopeType, SharedFunction};
 use j8compiler::Compile;
@@ -13,18 +14,33 @@ use j8framework::{Scope, BinaryOp, Closure, Code, ShapeKey, SmallStr, Collect, C
 use j8lockfree::SegVec;
 
 mod cache;
+mod debug;
 mod ic;
 mod jit;
 mod module;
 mod threaded;
 mod event_loop;
+mod interrupt;
 use module::EVAL_FILE;
 
 pub use cache::CodeCache;
+pub use debug::{Action, Breakpoint, BreakpointId, Debugger, PauseOnExceptions, Paused, Reason, ScopeKind, ScopeView};
 pub use event_loop::{EventLoop, EventLoopSet, Ticket, CHECK, SLICE};
+pub use interrupt::Interrupter;
 pub use jit::{DeoptFrame, Entry, FrameSlots, Function as JitFunction, GlobalFeedback, Insn as JitInsn, PropertyFeedback, Reg as JitReg, ScopeLayout, StringFeedback, Tier, Tiered};
 
 const STACK_LIMIT: usize = 10_000;
+
+pub struct Depth<'e> {
+    cell: &'e Cell<usize>,
+    saved: usize,
+}
+
+impl Drop for Depth<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.saved);
+    }
+}
 
 const REGEXP_FLAGS: [(u8, u16); 8] = [(b'd', 1 << 7), (b'g', 1), (b'i', 1 << 1), (b'm', 1 << 2), (b's', 1 << 5), (b'u', 1 << 4), (b'v', 1 << 8), (b'y', 1 << 3)];
 
@@ -43,7 +59,7 @@ const CHECK_STEPS: usize = 1024;
 const TIER_CALLS: u32 = 64;
 
 struct Insn {
-    handler: threaded::Handler,
+    handler: Cell<threaded::Handler>,
     bytecode: Bytecode,
     operands: Operands,
     start: u32,
@@ -86,6 +102,10 @@ struct Loaded {
 }
 
 impl Loaded {
+    fn note_instance(&self, o: JsObject<'_>) {
+        self.instance_size.set(u8::try_from(o.borrow().props().len()).unwrap_or(u8::MAX));
+    }
+
     fn code(&self) -> Code {
         unsafe { Code::from_id(self.this.get()) }
     }
@@ -174,9 +194,9 @@ impl Loaded {
                 } else {
                     d.bytecode
                 };
-                Insn { handler: Insn::handler(bytecode), bytecode, operands, start: u32::try_from(d.start()).unwrap_or(u32::MAX), target }
+                Insn { handler: Cell::new(Insn::handler(bytecode)), bytecode, operands, start: u32::try_from(d.start()).unwrap_or(u32::MAX), target }
             })
-            .chain(core::iter::once(Insn { handler: Insn::handler(Bytecode::Illegal), bytecode: Bytecode::Illegal, operands: Operands::default(), start: u32::try_from(bc.code.len()).unwrap_or(u32::MAX), target: 0 }))
+            .chain(core::iter::once(Insn { handler: Cell::new(Insn::handler(Bytecode::Illegal)), bytecode: Bytecode::Illegal, operands: Operands::default(), start: u32::try_from(bc.code.len()).unwrap_or(u32::MAX), target: 0 }))
             .collect()
     }
 
@@ -340,24 +360,45 @@ impl Frame {
         Some(self.slot(regs, Self::NEW_THIS)).filter(|v| !matches!(v.kind(), ValueKind::Uninit))
     }
 
+    fn constructing(&self, regs: &[Value<'_>]) -> bool {
+        self.slot(regs, Self::NEW_TARGET).bits() != j8framework::ValueBits::UNDEFINED
+    }
+
     fn args<'scope>(&self, regs: &[Value<'scope>]) -> Vec<Value<'scope>> {
         self.slot(regs, Self::ARGS).as_object().map_or_else(Vec::new, |o| o.elements().to_vec())
     }
 }
 
-#[derive(Collect)]
+#[derive(Collect, Default)]
 #[collect(no_drop)]
 struct State<'scope> {
     regs: Vec<Value<'scope>>,
     frames: Vec<Frame>,
     acc: Value<'scope>,
     message: Value<'scope>,
+    outer: usize,
 }
 
 impl<'scope> State<'scope> {
     fn new(regs: Vec<Value<'scope>>, mut frames: Vec<Frame>, f: Frame) -> Self {
         frames.push(f);
-        Self { regs, frames, acc: Value::Undefined, message: Value::Undefined }
+        Self { regs, frames, ..Self::default() }
+    }
+
+    #[inline]
+    fn level(&self) -> usize {
+        self.outer + self.frames.len()
+    }
+
+    #[inline]
+    fn push(&mut self, f: Frame) -> usize {
+        self.frames.push(f);
+        f.base
+    }
+
+    #[inline]
+    fn room(&self) -> bool {
+        self.level() + 1 < STACK_LIMIT
     }
 
     #[inline]
@@ -379,6 +420,14 @@ impl<'scope> State<'scope> {
         self.regs.truncate(done.params);
         true
     }
+
+    fn returned(&mut self, v: Value<'scope>) -> Flow<'scope> {
+        if !self.pop_frame() {
+            return Flow::Done(Outcome::Return(v));
+        }
+        self.acc = v;
+        Flow::Frame
+    }
 }
 
 enum Outcome<'scope> {
@@ -393,6 +442,13 @@ impl<'scope> Outcome<'scope> {
             Outcome::Paused(_) => unreachable!("only the outermost execution pauses"),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum Opening<'scope> {
+    Call,
+    Construct(Value<'scope>),
+    Resume(JsObject<'scope>),
 }
 
 #[derive(Clone, Copy)]
@@ -435,9 +491,36 @@ enum CallStep<'scope> {
     Bound(Value<'scope>, Value<'scope>, Vec<Value<'scope>>),
 }
 
-enum Callee<'scope> {
-    Closure { closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Vec<Value<'scope>> },
+enum Argv<'a, 'scope> {
+    Same(Args<'a, 'scope>),
+    Owned(Vec<Value<'scope>>),
+}
+
+impl<'scope> Argv<'_, 'scope> {
+    fn slice<'r>(&'r self, regs: &'r [Value<'scope>]) -> &'r [Value<'scope>] {
+        match self {
+            Argv::Same(Args::Values(v)) => v,
+            Argv::Same(Args::Regs { first, count }) => &regs[*first..*first + *count],
+            Argv::Owned(v) => v,
+        }
+    }
+
+    fn args(&self) -> Args<'_, 'scope> {
+        match self {
+            Argv::Same(a) => *a,
+            Argv::Owned(v) => Args::Values(v),
+        }
+    }
+}
+
+enum Callee<'a, 'scope> {
+    Closure { closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Argv<'a, 'scope> },
     Done(Value<'scope>),
+}
+
+enum Resumed<'scope> {
+    Step(Step<'scope>),
+    Frame(Vec<Value<'scope>>, Frame, usize),
 }
 
 enum Prepared<'scope> {
@@ -450,11 +533,12 @@ struct Budget<'s> {
     left: Option<usize>,
     stop: &'s j8framework::Termination,
     terminated: bool,
+    interrupted: bool,
 }
 
 impl<'s> Budget<'s> {
     fn new(stop: &'s j8framework::Termination, left: Option<usize>) -> Self {
-        Self { tick: 0, left, stop, terminated: false }
+        Self { tick: 0, left, stop, terminated: false, interrupted: false }
     }
 
     fn remaining(&self) -> Option<usize> {
@@ -462,8 +546,9 @@ impl<'s> Budget<'s> {
     }
 
     fn refill(&mut self) -> bool {
-        if self.stop.observe() {
-            self.terminated = true;
+        if self.stop.is_set() {
+            self.terminated = self.stop.observe();
+            self.interrupted = !self.terminated;
             return true;
         }
         let take = match &mut self.left {
@@ -489,6 +574,22 @@ impl<'s> Budget<'s> {
     }
 }
 
+struct Running {
+    state: NonNull<()>,
+    outer: Option<NonNull<Running>>,
+}
+
+#[derive(Default)]
+struct Active(Cell<Option<NonNull<Running>>>);
+
+unsafe impl Send for Active {}
+
+impl Executor<'_> {
+    pub(crate) fn is_running(&self) -> bool {
+        self.active.0.get().is_some()
+    }
+}
+
 #[derive(Default)]
 pub struct Executor<'p> {
     tier: Option<Box<dyn Tier + Send>>,
@@ -500,6 +601,49 @@ pub struct Executor<'p> {
     context_shapes: SegVec<ContextShape>,
     with_shape: Cell<Option<ShapeId>>,
     spare_frames: RefCell<Vec<Vec<Frame>>>,
+    active: Active,
+    interrupts: interrupt::Interrupts<'p>,
+    debug: Option<Box<debug::Debug<'p>>>,
+    raw: Cell<usize>,
+    deferred: Cell<bool>,
+    safe_next: Cell<bool>,
+    roots: RefCell<Option<j8framework::ScopeGlobal<'p, RootsBrand>>>,
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+struct RootCells<'scope>(Box<[j8framework::ValueCell<'scope>]>);
+
+j8framework::paragc::brand!(RootsBrand = for<'heap, 'scope> RootCells<'scope>);
+
+#[derive(Collect)]
+#[collect(no_drop)]
+struct FrameCodes(Box<[Code]>);
+
+j8framework::paragc::brand!(FrameCodesBrand = for<'heap, 'scope> FrameCodes);
+
+const MIN_ROOT_CELLS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    Go,
+    Pause,
+    Collected,
+}
+
+struct RawFrame<'e> {
+    raw: &'e Cell<usize>,
+    deferred: &'e Cell<bool>,
+    stop: &'e j8framework::Termination,
+}
+
+impl Drop for RawFrame<'_> {
+    fn drop(&mut self) {
+        self.raw.set(self.raw.get() - 1);
+        if self.deferred.take() {
+            self.stop.request_collect();
+        }
+    }
 }
 
 const _: () = {
@@ -530,6 +674,35 @@ impl Executor<'_> {
         if let Some(t) = &self.tier {
             t.entered();
         }
+    }
+
+    fn within(a: &Scope<'_, '_>, level: usize) -> Result<usize, Error> {
+        if level >= STACK_LIMIT {
+            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
+        }
+        Ok(level)
+    }
+
+    fn deeper(&self, a: &Scope<'_, '_>) -> Result<usize, Error> {
+        Self::within(a, self.depth.get() + 1)
+    }
+
+    pub fn at_depth(&self, level: usize) -> Depth<'_> {
+        Depth { cell: &self.depth, saved: self.depth.replace(level) }
+    }
+
+    fn deep<R>(&self, level: usize, f: impl FnOnce() -> R) -> R {
+        let _depth = self.at_depth(level);
+        f()
+    }
+
+    fn native_at<'scope, 'x, R>(&self, a: &mut Scope<'scope, 'x>, level: usize, new_target: Value<'scope>, f: impl FnOnce(&mut Scope<'scope, 'x>) -> R) -> R {
+        let _depth = self.at_depth(level);
+        let outer = core::mem::replace(&mut a.new_target, new_target);
+        a.handles.push(outer);
+        let r = f(a);
+        a.new_target = a.handles.pop().unwrap_or_default();
+        r
     }
 
     pub fn load(&self, mc: &j8framework::Mutation<'_>, module: Module) -> FuncId {
@@ -575,28 +748,12 @@ impl Executor<'_> {
         (!weak.is_cleared()).then(|| unsafe { code.get() })
     }
 
-    fn open<'scope>(&self, a: &mut Scope<'scope, '_>, regs: &mut Vec<Value<'scope>>, closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: &[Value<'scope>]) -> Frame {
-        self.open_with(a, regs, self.function(closure.func), closure, callee, this, Args::Values(args))
-    }
-
-    #[expect(clippy::too_many_arguments, reason = "the parts of a call")]
-    fn open_with<'scope>(&self, a: &mut Scope<'scope, '_>, regs: &mut Vec<Value<'scope>>, loaded: &Loaded, closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Args<'_, 'scope>) -> Frame {
-        let (params, base) = Self::open_regs(a, regs, loaded, closure, callee, this, args);
-        Frame { func: closure.func, loaded: LoadedRef::from(loaded), pc: 0, insn: 0, params, base, argc: args.len() }
-    }
-
     #[expect(clippy::too_many_arguments, reason = "the parts of a call")]
     #[inline]
-    fn push_open<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, loaded: &Loaded, closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Args<'_, 'scope>) -> usize {
-        let (params, base) = Self::open_regs(a, &mut st.regs, loaded, closure, callee, this, args);
-        st.frames.push(Frame { func: closure.func, loaded: LoadedRef::from(loaded), pc: 0, insn: 0, params, base, argc: args.len() });
-        base
-    }
-
-    fn open_regs<'scope>(a: &mut Scope<'scope, '_>, regs: &mut Vec<Value<'scope>>, loaded: &Loaded, closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Args<'_, 'scope>) -> (usize, usize) {
+    fn open<'scope>(a: &mut Scope<'scope, '_>, regs: &mut Vec<Value<'scope>>, loaded: &Loaded, closure: Closure<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Args<'_, 'scope>, how: Opening<'scope>) -> Frame {
         let f = &loaded.func;
         a.profiler.enter(closure.func);
-        let this = match this.kind() {
+        let receiver = match this.kind() {
             _ if !loaded.wraps_this => this,
             ValueKind::Undefined | ValueKind::Null => Value::Object(a.context.global),
             ValueKind::Object(_) | ValueKind::Uninit => this,
@@ -605,22 +762,23 @@ impl Executor<'_> {
         let kept = if loaded.keeps_args { Value::Object(a.array(args.to_vec(regs))) } else { Value::Undefined };
         let params = regs.len();
         let formals = usize::from(f.bytecode.parameter_count).saturating_sub(1);
-        regs.push(this);
+        regs.push(receiver);
         for i in 0..formals {
             let v = args.get(regs, i);
             regs.push(v);
         }
-        regs.extend_from_slice(&[kept, Value::Uninit, Value::Undefined, callee, closure.env.map_or(Value::Undefined, Value::context)]);
+        let (new_this, new_target, register) = match how {
+            Opening::Call => (Value::Uninit, Value::Undefined, Value::Undefined),
+            Opening::Construct(nt) => (this, nt, nt),
+            Opening::Resume(co) => (Value::Uninit, Value::Undefined, co.into()),
+        };
+        regs.extend_from_slice(&[kept, new_this, new_target, callee, closure.env.map_or(Value::Undefined, Value::context)]);
         let base = regs.len();
         regs.resize(base + f.bytecode.register_count as usize, Value::Undefined);
-        (params, base)
-    }
-
-    fn set_new_target<'scope>(regs: &mut [Value<'scope>], f: &mut Frame, nt: Value<'scope>) {
-        f.set_slot(regs, Frame::NEW_TARGET, nt);
-        if let Some(r) = unsafe { f.loaded.get::<'_>() }.func.bytecode.new_target_or_generator {
-            regs[f.base + usize::try_from(r).unwrap_or(0)] = nt;
+        if let Some(r) = f.bytecode.new_target_or_generator {
+            regs[base + usize::try_from(r).unwrap_or(0)] = register;
         }
+        Frame { func: closure.func, loaded: LoadedRef::from(loaded), pc: 0, insn: 0, params, base, argc: args.len() }
     }
 
     #[inline]
@@ -670,7 +828,8 @@ impl Executor<'_> {
         usize::try_from(slot).unwrap_or(0).saturating_sub(Context::MIN_SLOTS as usize)
     }
 
-    fn resolve<'scope>(&self, a: &mut Scope<'scope, '_>, mut callee: Value<'scope>, mut this: Value<'scope>, mut args: Vec<Value<'scope>>, depth: usize) -> Result<Callee<'scope>, Error> {
+    fn resolve<'a, 'scope>(&self, a: &mut Scope<'scope, '_>, regs: &[Value<'scope>], mut callee: Value<'scope>, mut this: Value<'scope>, args: Args<'a, 'scope>, level: usize) -> Result<Callee<'a, 'scope>, Error> {
+        let mut args = Argv::Same(args);
         while let ValueKind::Object(o) = callee.kind() {
             let step = if let Some(c) = o.closure() {
                 CallStep::Closure(c)
@@ -692,50 +851,36 @@ impl Executor<'_> {
                 && a.is_callable(this)
             {
                 let target = this;
-                let mut rest = args.into_iter();
+                let mut rest = args.slice(regs).iter().copied();
                 this = rest.next().unwrap_or_default();
-                args = match n.forward {
+                let list = match n.forward {
                     j8framework::Forward::Apply => match rest.next().unwrap_or_default().kind() {
                         ValueKind::Undefined | ValueKind::Null => Vec::new(),
                         list => a.list_from_array_like(Value::from(list))?,
                     },
                     _ => rest.collect(),
                 };
-                callee = target;
+                (callee, args) = (target, Argv::Owned(list));
                 continue;
             }
-            let saved = self.depth.replace(depth);
             let r = match step {
                 CallStep::Closure(c) => {
-                    self.depth.set(saved);
-                    let loaded = self.function(c.func);
+                    let loaded = self.code(&c);
                     if loaded.class_constructor {
                         return Err(a.throw(ErrorKind::Type, &alloc::format!("Class constructor {} cannot be invoked without 'new'", loaded.func.name)));
                     }
                     return Ok(Callee::Closure { closure: c, callee, this, args });
                 }
-                CallStep::Resolver => a.run_resolver(o, args.first().copied().unwrap_or_default()),
-                CallStep::Proxy => a.proxy_call(o, this, &args),
-                CallStep::NativeClosure(f) => {
-                    let outer = core::mem::replace(&mut a.new_target, Value::Undefined);
-                    let r = f(a, o, this, &args);
-                    a.new_target = outer;
-                    r
-                }
-                CallStep::Native(n) | CallStep::Forward(n) => {
-                    let outer = core::mem::replace(&mut a.new_target, Value::Undefined);
-                    let r = (n.f)(a, this, &args);
-                    a.new_target = outer;
-                    r
-                }
+                CallStep::Resolver => self.deep(level, || a.run_resolver(o, args.slice(regs).first().copied().unwrap_or_default())),
+                CallStep::Proxy => self.deep(level, || a.proxy_call(o, this, args.slice(regs))),
+                CallStep::NativeClosure(f) => self.native_at(a, level, Value::Undefined, |a| f(a, o, this, args.slice(regs))),
+                CallStep::Native(n) | CallStep::Forward(n) => self.native_at(a, level, Value::Undefined, |a| (n.f)(a, this, args.slice(regs))),
                 CallStep::Bound(target, bound_this, mut bound_args) => {
-                    self.depth.set(saved);
-                    bound_args.extend(args);
-                    (callee, this, args) = (target, bound_this, bound_args);
+                    bound_args.extend_from_slice(args.slice(regs));
+                    (callee, this, args) = (target, bound_this, Argv::Owned(bound_args));
                     continue;
                 }
             };
-            self.depth.set(saved);
             return r.map(Callee::Done);
         }
         let what = a.describe(callee);
@@ -752,65 +897,42 @@ impl Executor<'_> {
         Ok(if v.as_object().is_some() { v } else { this })
     }
 
-    fn prepare<'scope>(&self, a: &mut Scope<'scope, '_>, regs: &mut Vec<Value<'scope>>, mut callee: Value<'scope>, mut args: Vec<Value<'scope>>, mut new_target: Value<'scope>, depth: usize) -> Result<Prepared<'scope>, Error> {
+    fn prepare<'scope>(&self, a: &mut Scope<'scope, '_>, regs: &mut Vec<Value<'scope>>, mut callee: Value<'scope>, mut args: Vec<Value<'scope>>, mut new_target: Value<'scope>, level: usize) -> Result<Prepared<'scope>, Error> {
         while let ValueKind::Object(o) = callee.kind() {
-            let kind = match &o.borrow().kind {
-                ObjectKind::Function(c) => Ok(Ok(*c)),
-                ObjectKind::Native(n) => Ok(Err(*n)),
-                ObjectKind::NativeClosure(c) if c.constructor => {
-                    let f = c.f;
-                    let saved = self.depth.replace(depth);
-                    let r = Self::construct_closure(a, o, f, &args, new_target);
-                    self.depth.set(saved);
-                    return r.map(Prepared::Done);
-                }
-                ObjectKind::Bound(b) => Err(Some((b.target, b.args.clone()))),
-                ObjectKind::Proxy(p) if p.constructor => Err(None),
+            let step = match &o.borrow().kind {
+                ObjectKind::Function(c) => CallStep::Closure(*c),
+                ObjectKind::Native(n) if n.constructor => CallStep::Native(*n),
+                ObjectKind::NativeClosure(c) if c.constructor => CallStep::NativeClosure(c.f),
+                ObjectKind::Bound(b) => CallStep::Bound(b.target, b.this, b.args.clone()),
+                ObjectKind::Proxy(p) if p.constructor => CallStep::Proxy,
                 _ => break,
             };
-            match kind {
-                Ok(Ok(closure)) => {
-                    let loaded = self.function(closure.func);
+            return match step {
+                CallStep::Closure(closure) => {
+                    let loaded = self.code(&closure);
                     if !(loaded.constructs || loaded.class_constructor) {
                         break;
                     }
-                    let this = if loaded.derived {
-                        None
-                    } else {
-                        let this = Self::create_this(a, loaded, new_target)?;
-                        Some(Value::Object(this))
-                    };
-                    let mut f = self.open(a, regs, closure, callee, this.unwrap_or(Value::Uninit), &args);
-                    Self::set_new_target(regs, &mut f, new_target);
-                    f.set_slot(regs, Frame::NEW_THIS, this.unwrap_or(Value::Uninit));
-                    return Ok(Prepared::Frame(f));
+                    let this = if loaded.derived { Value::Uninit } else { Value::Object(Self::create_this(a, loaded, new_target)?) };
+                    Ok(Prepared::Frame(Self::open(a, regs, loaded, closure, callee, this, Args::Values(&args), Opening::Construct(new_target))))
                 }
-                Ok(Err(native)) => {
-                    if !native.constructor {
-                        break;
-                    }
-                    let saved = self.depth.replace(depth);
-                    let outer = core::mem::replace(&mut a.new_target, new_target);
-                    let r = (native.f)(a, Value::Undefined, &args);
-                    a.new_target = outer;
-                    self.depth.set(saved);
+                CallStep::Native(n) => {
+                    let r = self.native_at(a, level, new_target, |a| (n.f)(a, Value::Undefined, &args));
                     let Some(obj) = (r?).as_object() else { unreachable!("built-in constructors return objects") };
-                    return Ok(Prepared::Done(obj.into()));
+                    Ok(Prepared::Done(obj.into()))
                 }
-                Err(None) => {
-                    let saved = self.depth.replace(depth);
-                    let r = a.proxy_construct(o, &args, new_target);
-                    self.depth.set(saved);
-                    return r.map(Prepared::Done);
-                }
-                Err(Some((target, mut bound_args))) => {
+                CallStep::NativeClosure(f) => self.deep(level, || Self::construct_closure(a, o, f, &args, new_target)).map(Prepared::Done),
+                CallStep::Proxy => self.deep(level, || a.proxy_construct(o, &args, new_target)).map(Prepared::Done),
+                CallStep::Bound(target, _, mut bound_args) => {
                     if matches!(new_target.kind(), ValueKind::Object(t) if ScopeLocal::ptr_eq(t, o)) {
                         new_target = target;
                     }
                     bound_args.extend(args);
                     (callee, args) = (target, bound_args);
+                    continue;
                 }
-            }
+                CallStep::Resolver | CallStep::Forward(_) => unreachable!("not built for construction"),
+            };
         }
         let what = a.describe(callee);
         Err(a.throw(ErrorKind::Type, &alloc::format!("{what} is not a constructor")))
@@ -832,11 +954,11 @@ impl Executor<'_> {
         Ok(ObjectData::ordinary(a.mc, Some(proto), usize::from(ctor.instance_size.get())))
     }
 
-    fn construct_result<'scope>(&self, a: &Scope<'scope, '_>, regs: &[Value<'scope>], f: &Frame, v: Value<'scope>) -> Result<Value<'scope>, Error> {
-        let loaded = self.function(f.func);
-        if v.as_object().is_some() {
+    fn return_value<'scope>(&self, a: &Scope<'scope, '_>, regs: &[Value<'scope>], f: &Frame, v: Value<'scope>) -> Result<Value<'scope>, Error> {
+        if f.slot(regs, Frame::NEW_TARGET) == Value::Undefined || v.as_object().is_some() {
             return Ok(v);
         }
+        let loaded = self.function(f.func);
         let r = match (loaded.derived, f.new_this(regs)) {
             (true, _) if v != Value::Undefined => Err(a.throw(ErrorKind::Type, "Derived constructors may only return object or undefined")),
             (true, None) => Err(a.throw(ErrorKind::Reference, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor")),
@@ -844,7 +966,7 @@ impl Executor<'_> {
             (_, None) => Ok(v),
         };
         if let Ok(ValueKind::Object(o)) = r.as_ref().map(|v| v.kind()) {
-            loaded.instance_size.set(u8::try_from(o.borrow().props().len()).unwrap_or(u8::MAX));
+            loaded.note_instance(o);
         }
         r
     }
@@ -1254,7 +1376,7 @@ impl Executor<'_> {
         let env = self.script_context(a, main)?;
         let this = Value::Object(a.context.global);
         let mut regs = Vec::new();
-        let f = self.open(a, &mut regs, Closure::new(main, env), Value::Undefined, this, &[]);
+        let f = Self::open(a, &mut regs, self.function(main), Closure::new(main, env), Value::Undefined, this, Args::Values(&[]), Opening::Call);
         Ok(self.state(regs, f))
     }
 
@@ -1286,22 +1408,34 @@ impl Executor<'_> {
     }
 
     fn execute<'scope>(&self, a: &mut Scope<'scope, '_>, mut st: State<'scope>, budget: &mut Option<usize>) -> Result<Outcome<'scope>, Error> {
-        let base = self.depth.get();
+        if self.debug.is_some() {
+            self.debug_new_code(a);
+        }
+        st.outer = self.depth.get();
+        let _depth = self.at_depth(st.outer);
+        let _raw = (budget.is_none() && !self.safe_next.take()).then(|| self.raw_frame(a.stop));
+        let running = Running { state: NonNull::from(&st).cast(), outer: self.active.0.get() };
+        self.active.0.set(Some(NonNull::from(&running)));
         let mut b = Budget::new(a.stop, *budget);
         let r = loop {
-            match self.run(a, &mut st, base, &mut b) {
+            match self.run(a, &mut st, &mut b) {
+                Ok(None | Some(Outcome::Paused(_))) if b.terminated => break Err(Error::Terminated),
                 Ok(Some(v)) => break Ok(Some(v)),
-                Ok(None) if b.terminated => break Err(Error::Terminated),
                 Ok(None) => break Ok(None),
                 Err(Error::Exception) => {
+                    let reported = self.debug.is_none() || a.mc.rethrown();
                     let v = a.take_exception();
+                    if !reported {
+                        self.debug_throw(a, v, st.level());
+                    }
                     if !Self::unwind(&mut st, v) {
-                        break Err(a.throw_value(v));
+                        break Err(a.rethrow(v));
                     }
                 }
                 Err(e) => break Err(e),
             }
         };
+        self.active.0.set(running.outer);
         let r = match r {
             Ok(None) => Ok(Outcome::Paused(Box::new(st))),
             r => {
@@ -1310,17 +1444,17 @@ impl Executor<'_> {
             }
         };
         *budget = b.remaining();
-        self.depth.set(base);
         r
     }
 
-    fn run<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, depth: usize, budget: &mut Budget<'_>) -> Result<Option<Outcome<'scope>>, Error> {
+    fn run<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, budget: &mut Budget<'_>) -> Result<Option<Outcome<'scope>>, Error> {
         loop {
-            if budget.spent() {
+            if self.halts(a, budget) == Halt::Pause {
                 return Ok(None);
             }
             let loaded: &Loaded = unsafe { st.f().loaded.get() };
-            let mut cx = threaded::Cx { exe: self, a, st, loaded, budget, depth };
+            let generation = a.mc.generation();
+            let mut cx = threaded::Cx { exe: self, a, st, loaded, budget, generation };
             match Self::threaded(&mut cx) {
                 threaded::Exit::Frame => {}
                 threaded::Exit::Done(o) => return Ok(Some(o)),
@@ -1329,6 +1463,112 @@ impl Executor<'_> {
                 threaded::Exit::Next(..) => unreachable!("the loop in `threaded` takes these"),
             }
         }
+    }
+
+    #[inline]
+    fn halts(&self, a: &mut Scope<'_, '_>, budget: &mut Budget<'_>) -> Halt {
+        let mut collected = false;
+        while budget.interrupted || budget.spent() {
+            if !core::mem::take(&mut budget.interrupted) {
+                return Halt::Pause;
+            }
+            self.serve_interrupts(a);
+            collected |= self.serve_collect(a);
+        }
+        if collected { Halt::Collected } else { Halt::Go }
+    }
+
+    fn raw_frame<'e>(&'e self, stop: &'e j8framework::Termination) -> RawFrame<'e> {
+        self.raw.set(self.raw.get() + 1);
+        RawFrame { raw: &self.raw, deferred: &self.deferred, stop }
+    }
+
+    fn serve_collect(&self, a: &mut Scope<'_, '_>) -> bool {
+        if !a.stop.take_collect() {
+            return false;
+        }
+        if self.raw.get() > 0 {
+            self.deferred.set(true);
+            return false;
+        }
+        self.collect_at_safepoint(a)
+    }
+
+    fn collect_at_safepoint<'scope>(&self, a: &mut Scope<'scope, '_>) -> bool {
+        let mut states: Vec<NonNull<State<'scope>>> = Vec::new();
+        let mut at = self.active.0.get();
+        while let Some(running) = at {
+            let running = unsafe { running.as_ref() };
+            states.push(running.state.cast());
+            at = running.outer;
+        }
+        let pending = a.mc.take_exception();
+        let mut values: Vec<Value<'scope>> = Vec::new();
+        for st in &states {
+            let st = unsafe { st.as_ref() };
+            values.extend_from_slice(&st.regs);
+            values.push(st.acc);
+            values.push(st.message);
+        }
+        values.extend_from_slice(&a.handles);
+        values.push(a.new_target);
+        values.push(pending.unwrap_or(Value::Undefined));
+        let context = a.mc.stash::<j8framework::ContextBrand>(a.context);
+        let codes: Box<[Code]> = states.iter().flat_map(|st| unsafe { st.as_ref() }.frames.iter().map(|f| f.loaded.0)).collect();
+        let codes = a.mc.stash::<FrameCodesBrand>(a.mc.alloc(FrameCodes(codes)));
+        let used = self.hold_roots(a, &values);
+        let full = a.heap_limit_pending();
+        let collected = if full {
+            unsafe { a.mc.collect_full_here() };
+            true
+        } else {
+            unsafe { a.mc.collect_here() }
+        };
+        let cells = self.root_cells(a);
+        let mut back = cells.0.iter().map(|c| c.get());
+        for st in &mut states {
+            let st = unsafe { st.as_mut() };
+            for (r, v) in st.regs.iter_mut().zip(&mut back) {
+                *r = v;
+            }
+            st.acc = back.next().unwrap_or_default();
+            st.message = back.next().unwrap_or_default();
+        }
+        for h in &mut a.handles {
+            *h = back.next().unwrap_or_default();
+        }
+        a.new_target = back.next().unwrap_or_default();
+        let thrown = back.next().unwrap_or_default();
+        for c in &cells.0[..used] {
+            c.set(a.mc, Value::Undefined);
+        }
+        if pending.is_some() {
+            let _ = a.mc.raise(thrown);
+        }
+        a.context = a.mc.fetch(&context);
+        drop(codes);
+        a.recheck_heap_limit();
+        collected
+    }
+
+    fn root_cells<'scope>(&self, a: &Scope<'scope, '_>) -> j8framework::ScopeLocal<'scope, RootCells<'scope>> {
+        let roots = self.roots.borrow();
+        let Some(g) = roots.as_ref() else { unreachable!("cells held before collecting") };
+        a.mc.fetch(g)
+    }
+
+    fn hold_roots<'scope>(&self, a: &Scope<'scope, '_>, values: &[Value<'scope>]) -> usize {
+        let fits = self.roots.borrow().as_ref().is_some_and(|g| a.mc.fetch(g).0.len() >= values.len());
+        if !fits {
+            let n = values.len().next_power_of_two().max(MIN_ROOT_CELLS);
+            let cells = RootCells((0..n).map(|_| j8framework::ValueCell::new(Value::Undefined)).collect());
+            *self.roots.borrow_mut() = Some(a.mc.stash::<RootsBrand>(a.mc.alloc(cells)));
+        }
+        let cells = self.root_cells(a);
+        for (c, v) in cells.0.iter().zip(values) {
+            c.set(a.mc, *v);
+        }
+        values.len()
     }
 
     #[inline]
@@ -1354,45 +1594,12 @@ impl Executor<'_> {
         }
     }
 
-    #[inline]
-    fn push_frame(st: &mut State<'_>, next: Frame) {
-        st.frames.push(next);
-    }
-
-    fn call_from<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Args<'_, 'scope>, level: usize) -> Result<Flow<'scope>, Error> {
-        if level >= STACK_LIMIT {
-            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
-        }
-        if let ValueKind::Object(o) = callee.kind()
-            && let Some(c) = o.closure()
-        {
-            let l = self.function(c.func);
-            if !(l.class_constructor || l.generator || l.asynchronous) {
-                let next = self.open_with(a, &mut st.regs, l, c, callee, this, args);
-                Self::push_frame(st, next);
-                return Ok(Flow::Frame);
-            }
-        }
-        if let ValueKind::Object(o) = callee.kind()
-            && let Some(n) = o.native()
-            && n.forward == j8framework::Forward::No
-        {
-            let saved = self.depth.replace(level);
-            let outer = core::mem::replace(&mut a.new_target, Value::Undefined);
-            let r = match args {
-                Args::Values(v) => (n.f)(a, this, v),
-                Args::Regs { first, count } => (n.f)(a, this, &st.regs[first..first + count]),
-            };
-            a.new_target = outer;
-            self.depth.set(saved);
-            st.acc = r?;
-            return Ok(Flow::Next);
-        }
-        let args = args.to_vec(&st.regs);
-        match self.resolve(a, callee, this, args, level)? {
+    fn call_from<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, callee: Value<'scope>, this: Value<'scope>, args: Args<'_, 'scope>) -> Result<Flow<'scope>, Error> {
+        let level = Self::within(a, st.level() + 1)?;
+        match self.resolve(a, &st.regs, callee, this, args, level)? {
             Callee::Closure { closure, callee, this, args } => {
-                let next = self.open(a, &mut st.regs, closure, callee, this, &args);
-                Self::push_frame(st, next);
+                let next = Self::open(a, &mut st.regs, self.code(&closure), closure, callee, this, args.args(), Opening::Call);
+                st.push(next);
                 Ok(Flow::Frame)
             }
             Callee::Done(v) => {
@@ -1402,13 +1609,11 @@ impl Executor<'_> {
         }
     }
 
-    fn construct_from<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, callee: Value<'scope>, args: Vec<Value<'scope>>, new_target: Value<'scope>, level: usize) -> Result<Flow<'scope>, Error> {
-        if level >= STACK_LIMIT {
-            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
-        }
+    fn construct_from<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, callee: Value<'scope>, args: Vec<Value<'scope>>, new_target: Value<'scope>) -> Result<Flow<'scope>, Error> {
+        let level = Self::within(a, st.level() + 1)?;
         match self.prepare(a, &mut st.regs, callee, args, new_target, level)? {
             Prepared::Frame(next) => {
-                Self::push_frame(st, next);
+                st.push(next);
                 Ok(Flow::Frame)
             }
             Prepared::Done(v) => {
@@ -1447,9 +1652,9 @@ impl Executor<'_> {
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per bytecode")]
-    fn step<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, loaded: &Loaded, d: &Insn, level: usize, budget: &mut Budget<'_>) -> Result<Flow<'scope>, Error> {
+    fn step<'scope>(&self, a: &mut Scope<'scope, '_>, st: &mut State<'scope>, loaded: &Loaded, d: &Insn, budget: &mut Budget<'_>) -> Result<Flow<'scope>, Error> {
         let o = &d.operands;
-        let State { regs, frames, acc, message } = st;
+        let State { regs, frames, acc, message, .. } = st;
         let f = frames.last_mut().expect("a running frame");
         macro_rules! r {
             ($i:expr) => {
@@ -1755,16 +1960,19 @@ impl Executor<'_> {
                 f.pc = d.target as usize;
                 if let Some(t) = &self.tier {
                     let at = f.insn;
-                    let r = t.osr(&mut Entry { exe: self, a, st, budget, level }, at);
+                    let raw = self.raw_frame(a.stop);
+                    let r = t.osr(&mut Entry { exe: self, a, st, budget }, at);
+                    drop(raw);
                     match r {
                         Tiered::Interpret => {}
                         Tiered::Resumed => return Ok(Flow::Frame),
                         Tiered::Threw(e) => return Err(e),
                     }
                 }
-                let State { regs, frames, acc, message } = st;
-                if budget.spent() {
-                    return Ok(Flow::Done(Outcome::Paused(Box::new(State { regs: core::mem::take(regs), frames: core::mem::take(frames), acc: *acc, message: *message }))));
+                match self.halts(a, budget) {
+                    Halt::Pause => return Ok(Flow::Done(Outcome::Paused(Box::new(core::mem::take(st))))),
+                    Halt::Collected => return Ok(Flow::Frame),
+                    Halt::Go => {}
                 }
             }
             B::SwitchOnSmiNoFeedback => {
@@ -1789,7 +1997,7 @@ impl Executor<'_> {
                     B::CallUndefinedReceiver1 => (Value::Undefined, [r!(1), Value::Undefined], 1),
                     _ => (Value::Undefined, [r!(1), r!(2)], 2),
                 };
-                return self.call_from(a, st, callee, this, Args::Values(&buf[..n]), level + 1);
+                return self.call_from(a, st, callee, this, Args::Values(&buf[..n]));
             }
             B::CallProperty | B::CallAnyReceiver | B::CallUndefinedReceiver => {
                 let callee = r!(0);
@@ -1800,7 +2008,7 @@ impl Executor<'_> {
                     (_, 0) => (Value::Undefined, Args::Values(&[])),
                     _ => (regs[first], Args::Regs { first: first + 1, count: count - 1 }),
                 };
-                return self.call_from(a, st, callee, this, args, level + 1);
+                return self.call_from(a, st, callee, this, args);
             }
             B::CallWithSpread => {
                 let callee = r!(0);
@@ -1808,7 +2016,7 @@ impl Executor<'_> {
                 let spread = list.pop().unwrap_or_default();
                 let (this, mut args) = list.split_first().map_or((Value::Undefined, Vec::new()), |(t, rest)| (*t, rest.to_vec()));
                 args.extend(Self::spread(a, spread)?);
-                return self.call_from(a, st, callee, this, Args::Values(&args), level + 1);
+                return self.call_from(a, st, callee, this, Args::Values(&args));
             }
             B::Construct | B::ConstructWithSpread => {
                 let callee = r!(0);
@@ -1818,7 +2026,7 @@ impl Executor<'_> {
                     args.extend(Self::spread(a, spread)?);
                 }
                 let nt = *acc;
-                return self.construct_from(a, st, callee, args, nt, level + 1);
+                return self.construct_from(a, st, callee, args, nt);
             }
             B::CallJSRuntime => {
                 let list = Self::reg_list(regs, f, o[1], o[2]);
@@ -1826,12 +2034,12 @@ impl Executor<'_> {
                 return match NativeContextIndex::from_u8(u8::try_from(o[0]).unwrap_or(u8::MAX)) {
                     Some(NativeContextIndex::ReflectApply) => {
                         let args = a.list_from_array_like(arg(2))?;
-                        self.call_from(a, st, arg(0), arg(1), Args::Values(&args), level + 1)
+                        self.call_from(a, st, arg(0), arg(1), Args::Values(&args))
                     }
                     Some(NativeContextIndex::ReflectConstruct) => {
                         let args = a.list_from_array_like(arg(1))?;
                         let new_target = if list.len() > 2 { arg(2) } else { arg(0) };
-                        self.construct_from(a, st, arg(0), args, new_target, level + 1)
+                        self.construct_from(a, st, arg(0), args, new_target)
                     }
                     _ => Err(a.throw(ErrorKind::Type, "unsupported native context function")),
                 };
@@ -1952,7 +2160,8 @@ impl Executor<'_> {
                 Self::set_reg(regs, f, o[0], Value::Number(i + 1.0));
             }
             B::SetPendingMessage => core::mem::swap(acc, message),
-            B::Throw | B::ReThrow => return Err(a.throw_value(*acc)),
+            B::Throw => return Err(a.throw_value(*acc)),
+            B::ReThrow => return Err(a.rethrow(*acc)),
             B::ThrowReferenceErrorIfHole => {
                 if matches!(acc.kind(), ValueKind::Uninit) {
                     return Err(Self::uninitialized(a, Self::name_at(loaded, o[0])));
@@ -1989,7 +2198,7 @@ impl Executor<'_> {
                 let callee = r!(0);
                 let args = f.args(regs);
                 let nt = *acc;
-                return self.construct_from(a, st, callee, args, nt, level + 1);
+                return self.construct_from(a, st, callee, args, nt);
             }
             B::GetNamedPropertyFromSuper => {
                 let receiver = r!(0);
@@ -2026,12 +2235,7 @@ impl Executor<'_> {
                     c.state = j8framework::CoroutineState::Suspended;
                 });
                 let v = *acc;
-                return Ok(if st.pop_frame() {
-                    st.acc = v;
-                    Flow::Frame
-                } else {
-                    Flow::Done(Outcome::Return(v))
-                });
+                return Ok(st.returned(v));
             }
             B::ResumeGenerator => {
                 let Some(co) = r!(0).as_object() else { unreachable!("a generator object") };
@@ -2041,17 +2245,11 @@ impl Executor<'_> {
                 *acc = input;
             }
             B::Return => {
-                let v = *acc;
-                let v = if f.slot(regs, Frame::NEW_TARGET) == Value::Undefined { Ok(v) } else { self.construct_result(a, regs, f, v) };
-                let more = st.pop_frame();
-                let v = v?;
-                return Ok(if more {
-                    st.acc = v;
-                    Flow::Frame
-                } else {
-                    Flow::Done(Outcome::Return(v))
-                });
+                let v = self.return_value(a, regs, f, *acc);
+                let flow = st.returned(v.as_ref().copied().unwrap_or_default());
+                return v.map(|_| flow);
             }
+            B::Debugger => {}
             b => return Err(a.throw(ErrorKind::Syntax, &alloc::format!("bytecode {b:?} is not supported by the executor yet"))),
         }
         Ok(Flow::Next)
@@ -2346,7 +2544,7 @@ impl Executor<'_> {
                 }
                 let strict = arg(3).as_number().is_some_and(|x| x != 0.0);
                 let src = s.source_text();
-                let module = match Module::compile_direct(&j8framework::Source { text: &src, file: EVAL_FILE }, strict, s.lone_surrogates()) {
+                let module = match Module::compile_direct(&j8framework::Source { text: &src, file: EVAL_FILE }, strict, s.lone_surrogates(), self.debug_info()) {
                     Ok(m) => m,
                     Err(Error::Syntax(m)) => return Err(a.throw(ErrorKind::Syntax, &m)),
                     Err(e) => return Err(e),
@@ -2357,7 +2555,7 @@ impl Executor<'_> {
             }
             Runtime::DynamicImportCall => {
                 let referrer = self.referrer(a, loaded.base);
-                self.dynamic_import(a, &referrer, arg(1), self.depth.get() + 1)
+                self.dynamic_import(a, &referrer, arg(1))
             }
             Runtime::DeleteLookupSlot => {
                 let name = text(a, arg(0))?;
@@ -2407,11 +2605,94 @@ impl Executor<'_> {
         }
     }
 
+    fn resume_open<'scope>(&self, a: &mut Scope<'scope, '_>, co: JsObject<'scope>, mode: Resume, value: Value<'scope>) -> Result<Resumed<'scope>, Error> {
+        use j8framework::{CoroutineState as S, Settlement, Waiting as W};
+        let level = self.deeper(a)?;
+        a.check_stack()?;
+        let (state, waiting, async_generator) = Self::coroutine_mut(a, co, |c| (c.state, core::mem::replace(&mut c.waiting, W::Nothing), c.requests.is_some()));
+        let (mut mode, mut rethrow) = (mode, false);
+        match waiting {
+            W::Yield(_) if mode == Resume::Next => return Ok(Resumed::Step(Step::Yield(value))),
+            W::Yield(_) => rethrow = true,
+            W::Return => mode = if mode == Resume::Next { Resume::Return } else { Resume::Throw },
+            W::Nothing | W::Await(_) | W::Rethrow => {
+                if async_generator && mode == Resume::Return && state != S::Running {
+                    Self::coroutine_mut(a, co, |c| c.waiting = W::Return);
+                    return Ok(Resumed::Step(Step::Await(value)));
+                }
+            }
+        }
+        if state == S::Suspended {
+            Self::coroutine_mut(a, co, |c| {
+                c.state = S::Running;
+                c.mode = mode;
+                c.input = value;
+                c.settlement = Settlement::Nothing;
+                if rethrow {
+                    c.waiting = W::Rethrow;
+                }
+            });
+        }
+        match (state, mode) {
+            (S::Suspended, _) => {}
+            (S::Running, _) => return Err(a.throw(ErrorKind::Type, "Generator is already running")),
+            (S::Completed, Resume::Next) => return Ok(Resumed::Step(Step::Done(Value::Undefined))),
+            (S::Completed, Resume::Return) => return Ok(Resumed::Step(Step::Done(value))),
+            (S::Completed, Resume::Throw) => return Err(a.throw_value(value)),
+        }
+        let (callee, params) = Self::coroutine(co, |c| (c.frame.closure, c.frame.params.clone()));
+        let Some(closure) = callee.as_object().and_then(|o| match &o.borrow().kind {
+            ObjectKind::Function(c) => Some(*c),
+            _ => None,
+        }) else {
+            unreachable!("a generator's function")
+        };
+        let mut regs = a.take_regs();
+        regs.clear();
+        let (this, args) = params.split_first().map_or((Value::Undefined, &[][..]), |(t, rest)| (*t, rest));
+        self.note_user();
+        let f = Self::open(a, &mut regs, self.function(closure.func), closure, callee, this, Args::Values(args), Opening::Resume(co));
+        Ok(Resumed::Frame(regs, f, level))
+    }
+
+    fn resume_close<'scope>(&self, a: &mut Scope<'scope, '_>, co: JsObject<'scope>, r: Result<Value<'scope>, Error>) -> Result<Step<'scope>, Error> {
+        use j8framework::{CoroutineState as S, Settlement, Waiting as W};
+        let v = match r {
+            Ok(v) => v,
+            Err(e) => {
+                Self::coroutine_mut(a, co, |c| c.state = S::Completed);
+                return Err(e);
+            }
+        };
+        let (suspended, waiting, settlement) = Self::coroutine_mut(a, co, |c| {
+            let suspended = c.state == S::Suspended;
+            if !suspended {
+                c.state = S::Completed;
+            }
+            (suspended, c.waiting, core::mem::replace(&mut c.settlement, Settlement::Nothing))
+        });
+        match (suspended, waiting, settlement) {
+            (true, W::Await(w) | W::Yield(w), _) => Ok(Step::Await(w)),
+            (true, _, Settlement::Resolved(x)) => Ok(Step::Yield(x)),
+            (true, ..) => Ok(Step::Yield(v)),
+            (false, _, Settlement::Rejected(e)) => Err(a.throw_value(e)),
+            (false, _, Settlement::Resolved(x)) => Ok(Step::Done(x)),
+            (false, ..) => Ok(Step::Done(v)),
+        }
+    }
+
+    fn frames<'s, 'scope: 's>(&'s self) -> impl Iterator<Item = (&'s State<'scope>, &'s Frame)> + 's {
+        let mut at = self.active.0.get();
+        let states = core::iter::from_fn(move || {
+            let running = unsafe { at?.as_ref() };
+            at = running.outer;
+            Some(unsafe { running.state.cast::<State<'scope>>().as_ref() })
+        });
+        states.flat_map(|st| st.frames.iter().rev().map(move |f| (st, f)))
+    }
+
     fn run_frame<'scope>(&self, a: &mut Scope<'scope, '_>, regs: Vec<Value<'scope>>, f: Frame, level: usize) -> Result<Value<'scope>, Error> {
-        let saved = self.depth.replace(level);
-        let r = self.execute(a, self.state(regs, f), &mut None).map(Outcome::returned);
-        self.depth.set(saved);
-        r
+        self.deep(level, || self.execute(a, self.state(regs, f), &mut None).map(Outcome::returned))
     }
 }
 
@@ -2441,52 +2722,30 @@ enum Found<'scope> {
 
 impl<'scope> Invoke<'scope> for Executor<'_> {
     fn call(&self, a: &mut Scope<'scope, '_>, callee: Value<'scope>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-        let level = self.depth.get() + 1;
-        if level >= STACK_LIMIT {
-            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
-        }
-        if let ValueKind::Object(o) = callee.kind()
-            && let Some(c) = o.closure()
-            && let l = self.code(&c)
-            && !l.class_constructor
+        let safe = a.gc_safe.replace(false);
+        let level = self.deeper(a)?;
+        a.check_stack()?;
+        let (closure, callee, this, args) = match self.resolve(a, &[], callee, this, Args::Values(args), level)? {
+            Callee::Done(v) => return Ok(v),
+            Callee::Closure { closure, callee, this, args } => (closure, callee, this, args),
+        };
+        let l = self.code(&closure);
+        if !safe
+            && l.tier.get() != 0
+            && let Some(t) = &self.tier
+            && let Some(r) = self.deep(level, || {
+                let _raw = self.raw_frame(a.stop);
+                t.call(self, a, closure.func, callee, this, args.slice(&[]))
+            })
         {
-            if l.tier.get() != 0
-                && let Some(t) = &self.tier
-            {
-                let saved = self.depth.replace(level);
-                let r = t.call(self, a, c.func, callee, this, args);
-                self.depth.set(saved);
-                if let Some(r) = r {
-                    return r;
-                }
-            }
-            self.note_user();
-            let mut regs = a.take_regs();
-            regs.clear();
-            let f = self.open_with(a, &mut regs, l, c, callee, this, Args::Values(args));
-            return self.run_frame(a, regs, f, level);
-        }
-        if let ValueKind::Object(o) = callee.kind()
-            && let Some(n) = o.native()
-            && n.forward == j8framework::Forward::No
-        {
-            let saved = self.depth.replace(level);
-            let outer = core::mem::replace(&mut a.new_target, Value::Undefined);
-            let r = (n.f)(a, this, args);
-            a.new_target = outer;
-            self.depth.set(saved);
             return r;
         }
-        match self.resolve(a, callee, this, args.to_vec(), level)? {
-            Callee::Done(v) => Ok(v),
-            Callee::Closure { closure, callee, this, args } => {
-                self.note_user();
-                let mut regs = a.take_regs();
-                regs.clear();
-                let f = self.open(a, &mut regs, closure, callee, this, &args);
-                self.run_frame(a, regs, f, level)
-            }
-        }
+        self.note_user();
+        let mut regs = a.take_regs();
+        regs.clear();
+        let f = Self::open(a, &mut regs, l, closure, callee, this, args.args(), Opening::Call);
+        self.safe_next.set(safe);
+        self.run_frame(a, regs, f, level)
     }
 
     fn callback(&self, a: &mut Scope<'scope, '_>, callee: Value<'scope>, this: Value<'scope>) -> j8framework::Callback<'scope> {
@@ -2501,6 +2760,20 @@ impl<'scope> Invoke<'scope> for Executor<'_> {
         j8framework::Callback::from((callee, this))
     }
 
+    fn capture(&self, _: &Scope<'scope, '_>, limit: usize) -> Vec<j8framework::Captured> {
+        let captured = |(st, f): (&State<'_>, &Frame)| {
+            let loaded = unsafe { f.loaded.get() };
+            j8framework::Captured { code: f.loaded.0, at: loaded.insns.get(f.insn).map_or(0, |d| d.start), constructor: f.constructing(&st.regs) }
+        };
+        self.frames().take(limit).map(captured).collect()
+    }
+
+    fn call_site(&self, a: &Scope<'scope, '_>, frame: &j8framework::Captured) -> j8framework::CallSite {
+        let loaded: &Loaded = unsafe { frame.code.get() };
+        let (line, column) = loaded.func.bytecode.position_at(frame.at).map_or((0, 0), |p| (p.line, p.column));
+        j8framework::CallSite { function: loaded.func.name.clone(), script: self.referrer(a, loaded.base).into(), line, column, constructor: frame.constructor }
+    }
+
     fn constructs(&self, closure: &Closure<'scope>) -> bool {
         let loaded: &Loaded = unsafe { closure.code.expect("closures carry their code").get() };
         loaded.constructs || loaded.class_constructor
@@ -2508,105 +2781,30 @@ impl<'scope> Invoke<'scope> for Executor<'_> {
 
     fn eval_code(&self, a: &mut Scope<'scope, '_>, src: &str, kind: j8framework::CodeKind, hidden: bool) -> Result<Value<'scope>, Error> {
         let file = Executor::source_url(src).unwrap_or(EVAL_FILE);
-        let module = match Module::compile_eval(&j8framework::Source { text: src, file }, kind, hidden) {
+        let module = match Module::compile_eval(&j8framework::Source { text: src, file }, kind, hidden, self.debug_info()) {
             Ok(m) => m,
             Err(Error::Syntax(m)) => return Err(a.throw(ErrorKind::Syntax, &m)),
             Err(e) => return Err(e),
         };
         let main = self.load_script(a.mc, module, file);
-        let level = self.depth.get() + 1;
-        if level >= STACK_LIMIT {
-            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
-        }
+        let level = self.deeper(a)?;
         self.note_user();
-        let saved = self.depth.replace(level);
-        let r = self.run_script(a, main);
-        self.depth.set(saved);
-        r
+        self.deep(level, || self.run_script(a, main))
     }
 
     fn resume(&self, a: &mut Scope<'scope, '_>, co: JsObject<'scope>, mode: Resume, value: Value<'scope>) -> Result<Step<'scope>, Error> {
-        use j8framework::{CoroutineState as S, Settlement, Waiting as W};
-        let level = self.depth.get() + 1;
-        if level >= STACK_LIMIT {
-            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
-        }
-        let (state, waiting, async_generator) = Self::coroutine_mut(a, co, |c| (c.state, core::mem::replace(&mut c.waiting, W::Nothing), c.requests.is_some()));
-        let (mut mode, mut rethrow) = (mode, false);
-        match waiting {
-            W::Yield(_) if mode == Resume::Next => return Ok(Step::Yield(value)),
-            W::Yield(_) => rethrow = true,
-            W::Return => mode = if mode == Resume::Next { Resume::Return } else { Resume::Throw },
-            W::Nothing | W::Await(_) | W::Rethrow => {
-                if async_generator && mode == Resume::Return && state != S::Running {
-                    Self::coroutine_mut(a, co, |c| c.waiting = W::Return);
-                    return Ok(Step::Await(value));
-                }
+        match self.resume_open(a, co, mode, value)? {
+            Resumed::Step(step) => Ok(step),
+            Resumed::Frame(regs, f, level) => {
+                let r = self.run_frame(a, regs, f, level);
+                self.resume_close(a, co, r)
             }
-        }
-        if state == S::Suspended {
-            Self::coroutine_mut(a, co, |c| {
-                c.state = S::Running;
-                c.mode = mode;
-                c.input = value;
-                c.settlement = Settlement::Nothing;
-                if rethrow {
-                    c.waiting = W::Rethrow;
-                }
-            });
-        }
-        match (state, mode) {
-            (S::Suspended, _) => {}
-            (S::Running, _) => return Err(a.throw(ErrorKind::Type, "Generator is already running")),
-            (S::Completed, Resume::Next) => return Ok(Step::Done(Value::Undefined)),
-            (S::Completed, Resume::Return) => return Ok(Step::Done(value)),
-            (S::Completed, Resume::Throw) => return Err(a.throw_value(value)),
-        }
-        let (callee, params) = Self::coroutine(co, |c| (c.frame.closure, c.frame.params.clone()));
-        let Some(closure) = callee.as_object().and_then(|o| match &o.borrow().kind {
-            ObjectKind::Function(c) => Some(*c),
-            _ => None,
-        }) else {
-            unreachable!("a generator's function")
-        };
-        let mut regs = a.take_regs();
-        regs.clear();
-        let (this, args) = params.split_first().map_or((Value::Undefined, &[][..]), |(t, rest)| (*t, rest));
-        self.note_user();
-        let f = self.open(a, &mut regs, closure, callee, this, args);
-        if let Some(r) = self.function(closure.func).func.bytecode.new_target_or_generator {
-            regs[f.base + usize::try_from(r).unwrap_or(0)] = co.into();
-        }
-        let r = self.run_frame(a, regs, f, level);
-        let v = match r {
-            Ok(v) => v,
-            Err(e) => {
-                Self::coroutine_mut(a, co, |c| c.state = S::Completed);
-                return Err(e);
-            }
-        };
-        let (suspended, waiting, settlement) = Self::coroutine_mut(a, co, |c| {
-            let suspended = c.state == S::Suspended;
-            if !suspended {
-                c.state = S::Completed;
-            }
-            (suspended, c.waiting, core::mem::replace(&mut c.settlement, Settlement::Nothing))
-        });
-        match (suspended, waiting, settlement) {
-            (true, W::Await(w) | W::Yield(w), _) => Ok(Step::Await(w)),
-            (true, _, Settlement::Resolved(x)) => Ok(Step::Yield(x)),
-            (true, ..) => Ok(Step::Yield(v)),
-            (false, _, Settlement::Rejected(e)) => Err(a.throw_value(e)),
-            (false, _, Settlement::Resolved(x)) => Ok(Step::Done(x)),
-            (false, ..) => Ok(Step::Done(v)),
         }
     }
 
     fn construct(&self, a: &mut Scope<'scope, '_>, callee: Value<'scope>, args: &[Value<'scope>], new_target: Value<'scope>) -> Result<Value<'scope>, Error> {
-        let level = self.depth.get() + 1;
-        if level >= STACK_LIMIT {
-            return Err(a.throw(ErrorKind::Range, "Maximum call stack size exceeded"));
-        }
+        let level = self.deeper(a)?;
+        a.check_stack()?;
         let mut regs = Vec::new();
         match self.prepare(a, &mut regs, callee, args.to_vec(), new_target, level)? {
             Prepared::Done(v) => Ok(v),
@@ -2618,77 +2816,241 @@ impl<'scope> Invoke<'scope> for Executor<'_> {
     }
 }
 
+#[derive(Collect)]
+#[collect(no_drop)]
+enum After<'scope> {
+    Script,
+    Reaction(Option<j8framework::Capability<'scope>>),
+    Await(JsObject<'scope>),
+}
+
+#[derive(Clone, Copy)]
+enum Held {
+    Script,
+    Reaction(bool),
+    Await,
+}
+
+impl<'scope> After<'scope> {
+    fn hold(self, a: &mut Scope<'scope, '_>) -> Held {
+        match self {
+            After::Script => Held::Script,
+            After::Reaction(None) => Held::Reaction(false),
+            After::Reaction(Some(c)) => {
+                a.handles.extend([c.promise, c.resolve, c.reject]);
+                Held::Reaction(true)
+            }
+            After::Await(co) => {
+                a.handles.push(co.into());
+                Held::Await
+            }
+        }
+    }
+}
+
+impl Held {
+    fn restore<'scope>(self, a: &mut Scope<'scope, '_>, mark: usize) -> After<'scope> {
+        let held = a.handles.split_off(mark);
+        match (self, held.as_slice()) {
+            (Held::Reaction(true), &[promise, resolve, reject]) => After::Reaction(Some(j8framework::Capability { promise, resolve, reject })),
+            (Held::Await, &[co]) => After::Await(co.as_object().expect("a held coroutine")),
+            (Held::Reaction(false), &[]) => After::Reaction(None),
+            (Held::Script, &[]) => After::Script,
+            _ => unreachable!("the held values match what was held"),
+        }
+    }
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+struct Execution<'scope> {
+    state: State<'scope>,
+    after: After<'scope>,
+}
+
 j8framework::paragc::brand!(
-    ParkedBrand = for<'heap, 'scope> j8framework::GcCell<'scope, Option<State<'scope>>>
+    ParkedBrand = for<'heap, 'scope> j8framework::GcCell<'scope, Option<Execution<'scope>>>
 );
 
 type Parked<'p> = j8framework::ScopeGlobal<'p, ParkedBrand>;
 
-enum Slice<'p> {
-    Done(j8framework::ScopeGlobal<'p, j8framework::ValueBrand>),
-    Paused(Parked<'p>),
+enum Work {
+    Script { module: Module, file: alloc::string::String },
+    Module { text: alloc::string::String, file: alloc::string::String },
+    Drain,
+    Spent,
 }
 
-pub struct Job<'p>(Started<'p>);
+enum Next<'scope> {
+    Run(Execution<'scope>),
+    Paused,
+    Done,
+}
 
-enum Started<'p> {
-    Script { module: Module, file: alloc::string::String },
-    Paused(Parked<'p>),
-    Module { text: alloc::string::String, file: alloc::string::String },
-    Spent,
+pub struct Job<'p> {
+    work: Work,
+    parked: Option<Parked<'p>>,
+    value: Option<j8framework::ScopeGlobal<'p, j8framework::ValueBrand>>,
+    entry: Option<j8framework::ScopeGlobal<'p, j8framework::ValueBrand>>,
+}
+
+impl From<Work> for Job<'_> {
+    fn from(work: Work) -> Self {
+        Self { work, parked: None, value: None, entry: None }
+    }
 }
 
 impl<'p> Executor<'p> {
     pub const SLICE: usize = 10_000;
 
     pub fn start(&self, src: &j8framework::Source<'_>, kind: j8framework::ScriptKind) -> Result<Job<'p>, Error> {
-        Ok(Job(match kind {
-            j8framework::ScriptKind::Classic => Started::Script { module: Module::compile(src, j8framework::CodeKind::Script)?, file: src.file.into() },
-            j8framework::ScriptKind::Shared => Started::Script {
+        Ok(Job::from(match kind {
+            j8framework::ScriptKind::Classic => Work::Script { module: Module::compile(src, j8framework::CodeKind::Script, self.debug_info())?, file: src.file.into() },
+            j8framework::ScriptKind::Shared => Work::Script {
                 module: match &self.cache {
-                    Some(cache) => cache.script(src)?,
-                    None => Module::compile(src, j8framework::CodeKind::Script)?,
+                    Some(cache) => cache.script(src, self.debug_info())?,
+                    None => Module::compile(src, j8framework::CodeKind::Script, self.debug_info())?,
                 },
                 file: src.file.into(),
             },
-            j8framework::ScriptKind::Module => Started::Module { text: src.text.into(), file: src.file.into() },
+            j8framework::ScriptKind::Module => Work::Module { text: src.text.into(), file: src.file.into() },
         }))
     }
 
+    pub fn checkpoint() -> Job<'p> {
+        Job::from(Work::Drain)
+    }
+
     pub fn resume(&self, isolate: &mut j8framework::Isolate<'p>, cx: &j8framework::ScopeGlobal<'p, j8framework::ContextBrand>, job: &mut Job<'p>, quota: &mut j8framework::Quota) -> Result<Option<j8framework::ScopeGlobal<'p, j8framework::ValueBrand>>, Error> {
-        let this = self;
-        let started = core::mem::replace(&mut job.0, Started::Spent);
         let mut budget = Some(quota.left());
-        let slice = isolate.enter(cx, this, |a| -> Result<Slice, Error> {
-            let st = match started {
-                Started::Script { module, file } => {
-                    let main = this.load_script(a.mc, module, &file);
-                    this.script_state(a, main)?
-                }
-                Started::Paused(root) => j8framework::CellExt::borrow_mut(a.mc.fetch(&root), a.mc).take().expect("a parked state"),
-                Started::Module { text, file } => {
-                    this.run_module(a, &file, &text, 0)?;
-                    a.run_jobs()?;
-                    return Ok(Slice::Done(a.global(Value::Undefined)));
-                }
-                Started::Spent => unreachable!("a finished job is not resumed"),
-            };
-            match this.execute(a, st, &mut budget)? {
-                Outcome::Paused(st) => Ok(Slice::Paused(a.mc.stash::<ParkedBrand>(a.mc.alloc(j8framework::GcCell::new(a.mc, Some(*st)))))),
-                Outcome::Return(v) => {
-                    a.run_jobs()?;
-                    Ok(Slice::Done(a.global(v)))
-                }
-            }
-        });
+        let done = isolate.enter(cx, self, |a| self.advance(a, job, &mut budget));
         quota.spend(quota.left() - budget.unwrap_or(0));
-        match slice? {
-            Slice::Done(g) => Ok(Some(g)),
-            Slice::Paused(root) => {
-                job.0 = Started::Paused(root);
-                Ok(None)
+        if done? {
+            return Ok(job.value.take());
+        }
+        quota.spend(quota.left());
+        Ok(None)
+    }
+
+    fn advance<'scope>(&self, a: &mut Scope<'scope, '_>, job: &mut Job<'p>, budget: &mut Option<usize>) -> Result<bool, Error> {
+        loop {
+            let running = match job.parked.take() {
+                Some(root) => j8framework::CellExt::borrow_mut(a.mc.fetch(&root), a.mc).take().expect("a parked execution"),
+                None => match self.next_running(a, job, budget)? {
+                    Next::Run(r) => r,
+                    Next::Paused => return Ok(false),
+                    Next::Done => {
+                        if let Some(entry) = job.entry.take() {
+                            let promise = a.local(&entry);
+                            match Scope::promise_state(promise) {
+                                Some(j8framework::Settled::Rejected(reason)) => return Err(a.throw_value(reason)),
+                                Some(j8framework::Settled::Pending) => {
+                                    if let Some(p) = promise.as_object() {
+                                        a.set_promise_handled(p, false);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            job.value = Some(entry);
+                        }
+                        if job.value.is_none() {
+                            job.value = Some(a.global(Value::Undefined));
+                        }
+                        return Ok(true);
+                    }
+                },
+            };
+            let Execution { state, after } = running;
+            let mark = a.handles.len();
+            let held = after.hold(a);
+            let r = self.execute(a, state, budget);
+            let after = held.restore(a, mark);
+            match r {
+                Ok(Outcome::Paused(state)) => {
+                    job.parked = Some(a.mc.stash::<ParkedBrand>(a.mc.alloc(j8framework::GcCell::new(a.mc, Some(Execution { state: *state, after })))));
+                    return Ok(false);
+                }
+                Ok(Outcome::Return(v)) => self.finished(a, job, after, Ok(v))?,
+                Err(e) => self.finished(a, job, after, Err(e))?,
             }
         }
+    }
+
+    fn next_running<'scope>(&self, a: &mut Scope<'scope, '_>, job: &mut Job<'p>, budget: &mut Option<usize>) -> Result<Next<'scope>, Error> {
+        loop {
+            match &mut job.work {
+                Work::Script { .. } => {
+                    let Work::Script { module, file } = core::mem::replace(&mut job.work, Work::Drain) else { unreachable!("a script") };
+                    let main = self.load_script(a.mc, module, &file);
+                    return Ok(Next::Run(Execution { state: self.script_state(a, main)?, after: After::Script }));
+                }
+                Work::Module { .. } => {
+                    let Work::Module { text, file } = core::mem::replace(&mut job.work, Work::Drain) else { unreachable!("a module") };
+                    let promise = self.import(a, &file, &text)?;
+                    a.set_promise_handled(promise, true);
+                    job.entry = Some(a.global(promise.into()));
+                }
+                Work::Drain => {
+                    if *budget == Some(0) {
+                        return Ok(Next::Paused);
+                    }
+                    *budget = budget.map(|b| b - 1);
+                    let Some(next) = a.next_job() else {
+                        job.work = Work::Spent;
+                        return Ok(Next::Done);
+                    };
+                    if let Some(r) = self.job_running(a, next)? {
+                        return Ok(Next::Run(r));
+                    }
+                }
+                Work::Spent => return Ok(Next::Done),
+            }
+        }
+    }
+
+    fn job_running<'scope>(&self, a: &mut Scope<'scope, '_>, job: j8framework::Job<'scope>) -> Result<Option<Execution<'scope>>, Error> {
+        use j8framework::{Job as J, Reaction as R};
+        match job {
+            J::Reaction { reaction: R::Then { on_fulfilled, on_rejected, capability }, value, rejected } => {
+                let handler = if rejected { on_rejected } else { on_fulfilled };
+                if let ValueKind::Object(o) = handler.kind()
+                    && let Some(c) = o.closure()
+                    && let l = self.code(&c)
+                    && !l.class_constructor
+                {
+                    self.note_user();
+                    let mut regs = a.take_regs();
+                    regs.clear();
+                    let f = Self::open(a, &mut regs, l, c, handler, Value::Undefined, Args::Values(&[value]), Opening::Call);
+                    return Ok(Some(Execution { state: self.state(regs, f), after: After::Reaction(capability) }));
+                }
+            }
+            J::Reaction { reaction: R::Await { coroutine }, value, rejected } if !Self::coroutine(coroutine, |c| c.requests.is_some()) => {
+                let promise = Self::coroutine(coroutine, |c| c.promise);
+                let mode = if rejected { Resume::Throw } else { Resume::Next };
+                return match self.resume_open(a, coroutine, mode, value) {
+                    Ok(Resumed::Frame(regs, f, _)) => Ok(Some(Execution { state: self.state(regs, f), after: After::Await(coroutine) })),
+                    Ok(Resumed::Step(step)) => a.driven(promise, Ok(step)).map(|()| None),
+                    Err(e) => a.driven(promise, Err(e)).map(|()| None),
+                };
+            }
+            _ => {}
+        }
+        a.run_job(job)?;
+        Ok(None)
+    }
+
+    fn finished<'scope>(&self, a: &mut Scope<'scope, '_>, job: &mut Job<'p>, after: After<'scope>, r: Result<Value<'scope>, Error>) -> Result<(), Error> {
+        match after {
+            After::Script => job.value = Some(a.global(r?)),
+            After::Reaction(capability) => a.reacted(capability, r)?,
+            After::Await(co) => {
+                let promise = Self::coroutine(co, |c| c.promise);
+                let step = self.resume_close(a, co, r);
+                a.driven(promise, step)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn eval(&self, isolate: &mut j8framework::Isolate<'p>, cx: &j8framework::ScopeGlobal<'p, j8framework::ContextBrand>, src: &j8framework::Source<'_>) -> Result<j8framework::ScopeGlobal<'p, j8framework::ValueBrand>, Error> {

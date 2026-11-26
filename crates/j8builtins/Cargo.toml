@@ -16,6 +16,25 @@ regress.workspace = true
 regex.workspace = true
 ryu-js.workspace = true
 unicode-normalization = { version = "0.1", default-features = false }
+icu_locale = { workspace = true, optional = true }
+icu_decimal = { workspace = true, optional = true }
+icu_datetime = { workspace = true, optional = true }
+icu_calendar = { workspace = true, optional = true }
+icu_time = { workspace = true, optional = true }
+icu_collator = { workspace = true, optional = true }
+icu_casemap = { workspace = true, optional = true }
+icu_plurals = { workspace = true, optional = true }
+icu_list = { workspace = true, optional = true }
+icu_segmenter = { workspace = true, optional = true }
+icu_experimental = { workspace = true, optional = true }
+icu_locale_core = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
+icu_provider = { workspace = true, optional = true }
+fixed_decimal = { workspace = true, optional = true }
+writeable = { workspace = true, optional = true }
+
+[features]
+intl = ["dep:icu_locale", "dep:icu_decimal", "dep:icu_datetime", "dep:icu_calendar", "dep:icu_time", "dep:icu_collator", "dep:icu_casemap", "dep:icu_plurals", "dep:icu_list", "dep:icu_segmenter", "dep:icu_experimental", "dep:icu_locale_core", "dep:jiff", "dep:icu_provider", "dep:fixed_decimal", "dep:writeable"]
 
 [lints]
 workspace = true

@@ -132,6 +132,7 @@ impl<'scope, T: for<'g> FromJs<'g> + Send + 'static> FromJs<'scope> for Promise<
                     Error::Exception => a.park(),
                     e => e,
                 }));
+                Ok(())
             }),
         )?;
         Ok(Self(rx))

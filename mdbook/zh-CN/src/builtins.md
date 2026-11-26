@@ -26,23 +26,48 @@ let cx = isolate.create_context(&j8builtins::Builtins);
 | `promise.rs`、`asyncgen.rs`、`iter.rs` | `Promise`、异步生成器、迭代器与迭代器助手 |
 | `error.rs` | `Error`、`TypeError` … `AggregateError`，`cause` |
 | `helpers.rs` | 共用的规范步骤 |
+| `intl/` | `Intl` 与依赖语言区域的方法，开 `intl` feature 时编入（见下文） |
 
 ## 覆盖范围
 
-- **Object / Array** 的全部方法：Array 方法对类数组通用、species；`from` / `flat` / `toSorted` / `with` ……
+- **Object / Array** 的全部方法：Array 方法对类数组通用、species；`from` / `flat` / `toSorted` / `with` ……；
+  `join` / `toLocaleString` 遇到正在 join 的数组给 `""`（和 V8、SpiderMonkey 一样），正在 join 的数组记在 `Scope` 上
+  （`Scope::joining`，一个 `Visiting` 栈，`JSON.stringify` 找环用的也是它）；
 - **反射**：`Reflect`、`Proxy`（含 revocable）；
 - **迭代器助手**：全局 `Iterator`、`Iterator.from`、`map` / `filter` / `take` / `drop` / `flatMap` / `reduce` ……；
   Set 方法（`union` 等）、`Map.groupBy` / `Object.groupBy`；
 - **二进制数据**：可调大小的 `ArrayBuffer`（`transfer`、detach）、可增长的 `SharedArrayBuffer`、`DataView`、
   `Atomics`（单线程语义）；
-- **Date**（本地时区按 UTC 处理）；**数的格式化**（`toFixed` / `toPrecision` / `toExponential` 精确到十进制）、
-  `Math.sumPrecise` / `f16round`；
+- **Date**（开 `intl` feature 时本地时区取 `Platform::time_zone`，否则按 UTC 处理）；**数的格式化**（`toFixed` /
+  `toPrecision` / `toExponential` 精确到十进制）、`Math.sumPrecise` / `f16round`；
 - **RegExp**：Symbol 协议、`lastIndex`、`d` 标志、具名分组、species、`RegExp.escape`；字符串的
   `match` / `matchAll` / `replace` / `replaceAll` / `search` / `split`；
 - **Promise** 建在 NewPromiseCapability 上：子类化、`all` / `race` / `allSettled` / `any` / `withResolvers` / `try`；
 - 内建构造器按 `new.target` 定原型，所以 `class X extends Map` 之类能工作；宿主函数区分能否 `new`。
 
-范围外：Temporal、intl402、ShadowRealm 等（见[路线图](roadmap.md)）。
+范围外：Temporal、ShadowRealm 等（见[路线图](roadmap.md)）。
+
+## Intl
+
+`intl` feature（`j8builtins/intl`，根包 `j8/intl` 转出）在 [ICU4X](https://github.com/unicode-org/icu4x) 的编译期数据上实现
+ECMA-402，运行时不需要数据文件：
+
+- `Intl.getCanonicalLocales`、`Intl.supportedValuesOf`、`supportedLocalesOf`；协商语言区域时，ICU4X 的 likely-subtags
+  数据认得其语言的就算可用；
+- `Intl.Collator` 与 `String.prototype.localeCompare`；`toLocaleUpperCase` / `toLocaleLowerCase`（土耳其语、阿塞拜疆语、
+  立陶宛语规则）；
+- `Intl.NumberFormat`：位数选项与全部舍入模式、科学 / 工程 / 紧凑记数法、符号显示、分组、数字系统、`formatToParts`；
+  `Number` / `BigInt` 的 `toLocaleString`。货币和单位样式输出 ISO 代码或单位标识符，百分比用普通的 `%`（这几种的 CLDR
+  格式不在 ICU4X 的稳定数据里）；
+- `Intl.DateTimeFormat`：各字段选项、`dateStyle` / `timeStyle`、小时制、历法、IANA 时区与 UTC 偏移（时区规则用
+  [jiff](https://crates.io/crates/jiff) 内置的 tzdb）、`formatToParts`；`Date` 的 `toLocaleString` / `toLocaleDateString`
+  / `toLocaleTimeString`；
+- `Intl.PluralRules`：基数与序数规则，`select` 先按 NumberFormat 的方式舍入，`selectRange`；
+- 默认语言区域与时区取 `Platform::locale` / `Platform::time_zone`，取不到时用 `en-US` 与 `UTC`；有时区时，`Date` 的
+  本地时间方法和 `toString` 也用它。
+
+选项对象按规范给的顺序读，test262 用例装的 getter 触发顺序一致。每个 `Intl` 实例是宿主对象，持有构造时建好的 ICU4X
+格式化器。数据在去掉符号的二进制里约占 7 MB。
 
 ## 正则：两个引擎
 

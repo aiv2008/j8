@@ -56,6 +56,7 @@ impl<'scope> Scope<'scope, '_> {
     }
 
     fn trap(&mut self, handler: JsObject<'scope>, trap: Trap) -> Result<Option<Value<'scope>>, Error> {
+        self.check_stack()?;
         match (self.get_named(handler.into(), trap.name())?).kind() {
             ValueKind::Undefined | ValueKind::Null => Ok(None),
             f if self.is_callable(f.into()) => Ok(Some(f.into())),

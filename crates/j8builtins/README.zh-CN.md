@@ -28,6 +28,7 @@ let cx = isolate.create_context(&j8builtins::Builtins);
 | `collections.rs`、`weak.rs` | `Map` / `Set`、`WeakMap` / `WeakSet` / `WeakRef` / `FinalizationRegistry` |
 | `promise.rs`、`asyncgen.rs`、`iter.rs` | Promise、异步生成器、迭代器与迭代器辅助方法 |
 | `error.rs` | `Error` 系列 |
+| `intl/` | `Intl`（`Collator`、`NumberFormat`、`DateTimeFormat`、`PluralRules`）与 `toLocale*` 方法，开 `intl` feature 时编入（ICU4X） |
 
 热点内建函数有快路径：可观察的行为不可能不同时（`RegExp.prototype` 没被动过、往稠密数组末尾追加、字符串与数字的拼接）跳过完整的规范步骤。
 正确性以 test262 为准。

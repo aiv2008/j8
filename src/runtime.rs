@@ -1,8 +1,9 @@
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use j8executor::{EventLoop, EventLoopSet, Executor};
-use j8framework::{Scope, Error, ErrorKind, Platform, Pool, ScopeGlobal, ScriptKind, Source, Task, Value, ValueBrand};
+use j8framework::{Scope, Error, ErrorKind, HeapLimitCallback, Platform, Pool, ScopeGlobal, ScriptKind, Source, Task, Value, ValueBrand};
 
 pub trait Host {
     fn install(a: &mut Scope<'_, '_>);
@@ -53,8 +54,20 @@ impl<H: Host, P: Platform> Platform for HostPlatform<H, P> {
         }
     }
 
+    fn locale(&self) -> Option<String> {
+        self.inner.locale()
+    }
+
+    fn time_zone(&self) -> Option<String> {
+        self.inner.time_zone()
+    }
+
     fn print(&self, line: &str) {
         self.inner.print(line);
+    }
+
+    fn unhandled_rejection<'scope>(&self, scope: &mut Scope<'scope, '_>, promise: j8framework::JsObject<'scope>, reason: Value<'scope>) {
+        self.inner.unhandled_rejection(scope, promise, reason);
     }
 }
 
@@ -96,7 +109,7 @@ impl<'p> Runtime<'p> {
     pub fn exception_text(&self) -> String {
         self.enter(|a| {
             let v = a.take_exception();
-            let text = a.to_string(v).map(|s| String::from(&**s));
+            let text = a.stack_text(v).map(|s| String::from(&**s));
             text.unwrap_or_else(|_| {
                 let _ = a.take_exception();
                 String::from("<ToString threw>")
@@ -120,6 +133,18 @@ impl<'p> Runtime<'p> {
 
     pub fn run_until_idle(&self) -> Result<(), Error> {
         self.js.run()
+    }
+
+    pub fn interrupter(&self) -> j8executor::Interrupter<'p> {
+        self.js.interrupter()
+    }
+
+    pub fn set_heap_limit(&self, limit: Option<NonZeroUsize>, callback: Option<HeapLimitCallback<'p>>) {
+        self.js.set_heap_limit(limit, callback);
+    }
+
+    pub fn heap_used(&self) -> usize {
+        self.js.heap_used()
     }
 }
 

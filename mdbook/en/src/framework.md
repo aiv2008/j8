@@ -107,12 +107,42 @@ request at checkpoints (function entries, back edges; in JIT code, back edges) a
 a JS exception: `catch` / `finally` can't catch it, and it goes all the way out. Leaving the outermost entry resets it,
 so the isolate stays usable.
 
+## Interrupting execution
+
+An `Interrupter` (from `EventLoop::interrupter` or `Runtime::interrupter`) runs a closure on the event loop's JS thread
+from any thread (V8's `RequestInterrupt`): `interrupter.interrupt(|executor, scope| …)` queues it with the executor,
+sets the interrupt bit and rings the loop. Running JS sees the bit at the termination checkpoints (every 1024
+instructions; in JIT code, back edges), runs the queued closures with the executor and the current scope, and goes on.
+JIT code doesn't run them in its own frame: it deoptimizes at the check and the interpreter runs them and continues
+from the same instruction, so a closure that runs JS and changes globals or shapes can't break what the machine code
+assumed. An idle event loop runs them at the start of its next turn, so a closure doesn't wait for the next JS. A
+long-running native builtin (a big `sort`, regular expression backtracking, a big `JSON.parse`) has no checkpoints: an
+interrupt waits until it returns.
+
+The termination byte has two uses: its low bits hold the termination state (requested, unwinding) and one more bit is
+the pending interrupt. Termination only reads and changes its own bits, so it works as before alongside an interrupt.
+With nothing pending the checkpoints read the byte once, as before; both requests are handled behind the branch that a
+set byte already takes.
+
+## Heap limit
+
+`EventLoop::set_heap_limit(Some(bytes), callback)` limits the bytes the GC heap holds (paragc's `Heap::used`: blocks plus
+large objects). The isolate arms the limit in paragc, which checks it only when it takes a block or makes a large object;
+the first one past the limit calls the hook, and the event loop's hook queues an interrupt. On the JS thread
+`Scope::check_heap_limit` asks `callback(current, initial)` for the new limit (the shape of V8's near-heap-limit callback,
+but called after the limit is passed): JS goes on under it and is terminated over it, where V8 would crash out of
+memory. An interrupt served while no JS runs does nothing. At each safe point the isolate runs a full collection once the
+heap has grown by half the limit since the last one, then arms the limit again: garbage from earlier tasks does not
+count, and a heap whose live data stays large is not collected every turn. Memory outside the GC heap (`ArrayBuffer`
+bytes) is not counted.
+
 ## Other parts
 
 | File | Contents |
 |---|---|
 | `promise.rs` | promises and microtasks: resolve / reject, `then` reactions, driving async coroutines, draining the queue |
 | `module.rs` | module records, import / export entries, `ResolvedBinding` |
+| `evaluation.rs` | module evaluation: the cyclic module record algorithm, top-level `await` and the evaluation promise |
 | `proxy.rs` | Proxy: internal-method entry points dispatched to traps, with invariant checks |
 | `typed.rs`, `backing.rs` | TypedArray elements; where an ArrayBuffer's bytes live (its own, host-mapped, shared between isolates) |
 | `text.rs` | strings (see the [object model](objects.md)) |

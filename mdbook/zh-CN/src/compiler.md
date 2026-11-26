@@ -68,9 +68,11 @@ oxc 解析出 AST，再用 `oxc_semantic` 做语义检查。规范要求的**早
 宿主一般不直接调编译器，由执行器自己调用：
 
 ```rust,ignore
-use j8compiler::Compile;
+use j8compiler::{Compile, DebugInfo};
 use j8framework::{CodeKind, Source};
 
-let module = j8bytecode::Module::compile(&Source { text: "1 + 2", file: "a.js" }, CodeKind::Script)?;
-let (module, info) = j8bytecode::Module::compile_module(&source)?;   // ES 模块，连同导入 / 导出信息
+let module = j8bytecode::Module::compile(&Source { text: "1 + 2", file: "a.js" }, CodeKind::Script, DebugInfo::Omit)?;
+let (module, info) = j8bytecode::Module::compile_module(&source, DebugInfo::Omit)?;   // ES 模块，连同导入 / 导出信息
 ```
+
+`DebugInfo::Record` 另外为[调试器](debugger.md)记下语句位置和局部变量名（`BytecodeArray::debug`）；执行器只在接了调试器时才要它。

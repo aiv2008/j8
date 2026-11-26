@@ -6,9 +6,14 @@
 file (canonical paths, no `node_modules`). For other rules (packages, URLs, a virtual file system), write your own
 `Platform::load_module`.
 
-On the executor's side, loading, linking and evaluation are synchronous; import bindings read the exporter's slots live;
-`ResolveExport` handles indirect exports, `export *` and ambiguity; namespace objects, dynamic `import()` and
-`import.meta` are supported. Top-level `await` is not yet.
+`eval_module` returns the promise for the module's evaluation. Without top-level `await` it is already fulfilled when
+`eval_module` returns; with it, `run_until_idle` drives the awaiting modules and the promise settles when the whole
+graph has finished. A module that throws before it first suspends still makes `eval_module` return an error.
+
+On the executor's side, loading and linking are synchronous; evaluation follows the spec's cyclic module records, so a
+module that uses top-level `await` runs as an async function and the modules that import it wait for it. Import
+bindings read the exporter's slots live; `ResolveExport` handles indirect exports, `export *` and ambiguity; namespace
+objects, dynamic `import()` and `import.meta` are supported.
 
 ## Native modules in Rust: `#[j8::module]`
 

@@ -8,7 +8,7 @@ autotests = false
 repository.workspace = true
 readme = "README.md"
 # Publish only the library: the tests/test262 submodule has over fifty thousand files, too many for crates.io
-include = ["/src", "/tests/binding.rs", "/tests/runtime.rs", "/tests/bindings_more.rs", "/tests/event_loop.rs", "/tests/terminate.rs", "/tests/jit_typeof.rs", "/tests/jit_lazy.rs", "/tests/jit_stack.rs", "/tests/regexp_fast.rs", "/tests/json_fast.rs", "/tests/jit_callbacks.rs", "/tests/jit_args.rs", "/tests/jit_intrinsics.rs", "/tests/jit_mod.rs", "/tests/jit_regexp.rs", "/tests/string_fast.rs", "/README.md", "/README.zh-CN.md", "/EMBEDDING.md", "/LICENSE"]
+include = ["/src", "/tests/binding.rs", "/tests/runtime.rs", "/tests/bindings_more.rs", "/tests/event_loop.rs", "/tests/terminate.rs", "/tests/heap_limit.rs", "/tests/gc_safepoint.rs", "/tests/jit_typeof.rs", "/tests/jit_lazy.rs", "/tests/jit_stack.rs", "/tests/regexp_fast.rs", "/tests/json_fast.rs", "/tests/jit_callbacks.rs", "/tests/jit_args.rs", "/tests/jit_intrinsics.rs", "/tests/jit_mod.rs", "/tests/jit_regexp.rs", "/tests/string_fast.rs", "/tests/stack.rs", "/tests/debugger.rs", "/tests/top_level_await.rs", "/tests/native_stack.rs", "/README.md", "/README.zh-CN.md", "/EMBEDDING.md", "/LICENSE"]
 
 [lib]
 name = "j8"
@@ -42,6 +42,8 @@ compiler = ["dep:j8compiler", "bytecode"]
 executor = ["dep:j8executor", "compiler"]
 # j8::builtins: built-in objects (the Intrinsics implementation)
 builtins = ["dep:j8builtins"]
+# Intl (ECMA-402) on top of ICU4X compiled data: Collator, NumberFormat, DateTimeFormat and the toLocale* methods
+intl = ["builtins", "j8builtins/intl"]
 # j8::platform: the standard-library Platform
 platform = ["dep:j8platform"]
 # j8::taskqueue: lock-free dataflow task queue
@@ -54,14 +56,14 @@ jit = ["executor", "dep:j8jit"]
 json = ["j8binding/json"]
 # j8::napi: Node-API (the C interface native addons link against)
 napi = ["dep:j8napi"]
-full = ["runtime", "taskqueue", "lockfree", "jit", "json", "napi"]
+full = ["runtime", "taskqueue", "lockfree", "jit", "json", "napi", "intl"]
 # Cross-process JS objects (Linux only): a paragc cross-heap as the old generation, objects shared by signature
 crossheap = ["j8framework/crossheap"]
 
 [dev-dependencies]
 paragc.workspace = true
 j8executor.workspace = true
-j8builtins.workspace = true
+j8builtins = { workspace = true, features = ["intl"] }
 j8platform.workspace = true
 j8jit.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -90,8 +92,20 @@ name = "event_loop"
 path = "tests/event_loop.rs"
 
 [[test]]
+name = "top_level_await"
+path = "tests/top_level_await.rs"
+
+[[test]]
 name = "terminate"
 path = "tests/terminate.rs"
+
+[[test]]
+name = "interrupt"
+path = "tests/interrupt.rs"
+
+[[test]]
+name = "heap_limit"
+path = "tests/heap_limit.rs"
 
 [[test]]
 name = "crossheap"
@@ -117,6 +131,14 @@ path = "tests/jit_lazy.rs"
 [[test]]
 name = "jit_stack"
 path = "tests/jit_stack.rs"
+
+[[test]]
+name = "native_stack"
+path = "tests/native_stack.rs"
+
+[[test]]
+name = "gc_safepoint"
+path = "tests/gc_safepoint.rs"
 
 [[test]]
 name = "regexp_fast"
@@ -145,6 +167,14 @@ path = "tests/jit_regexp.rs"
 [[test]]
 name = "string_fast"
 path = "tests/string_fast.rs"
+
+[[test]]
+name = "stack"
+path = "tests/stack.rs"
+
+[[test]]
+name = "debugger"
+path = "tests/debugger.rs"
 
 
 [[test]]
@@ -187,7 +217,7 @@ j8napi = { version = "0.5.1", path = "crates/j8napi" }
 j8 = { version = "0.5.1", path = "." }
 moremath = { version = "=0.2.3", default-features = false }
 libm = "0.2"
-paragc = "0.7.0"
+paragc = "0.7.2"
 j8lockfree = { version = "0.5.1", path = "crates/j8lockfree" }
 j8taskqueue = { version = "0.5.1", path = "crates/j8taskqueue" }
 hashbrown = { version = "0.17", default-features = false }
@@ -204,6 +234,22 @@ oxc_span = "0.158"
 oxc_str = "0.158"
 oxc_semantic = "0.158"
 oxc_syntax = "0.158"
+icu_locale = { version = "~2.4", default-features = false, features = ["compiled_data"] }
+icu_locale_core = { version = "~2.4", default-features = false, features = ["alloc"] }
+icu_decimal = { version = "~2.4", default-features = false, features = ["compiled_data", "unstable"] }
+icu_datetime = { version = "~2.4", default-features = false, features = ["compiled_data", "unstable"] }
+icu_calendar = { version = "~2.4", default-features = false, features = ["compiled_data"] }
+icu_time = { version = "~2.4", default-features = false, features = ["compiled_data"] }
+icu_collator = { version = "~2.4", default-features = false, features = ["compiled_data"] }
+icu_casemap = { version = "~2.4", default-features = false, features = ["compiled_data"] }
+icu_plurals = { version = "~2.4", default-features = false, features = ["compiled_data", "unstable"] }
+icu_list = { version = "~2.4", default-features = false, features = ["compiled_data", "alloc"] }
+icu_segmenter = { version = "~2.4", default-features = false, features = ["compiled_data", "auto"] }
+icu_experimental = { version = "~0.7", default-features = false, features = ["compiled_data"] }
+icu_provider = { version = "~2.4", default-features = false, features = ["sync"] }
+fixed_decimal = { version = "~0.7", default-features = false, features = ["ryu"] }
+writeable = { version = "~0.6", default-features = false }
+jiff = { version = "~1.0", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

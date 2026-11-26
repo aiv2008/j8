@@ -31,6 +31,7 @@
 - [异步与 Promise](async.md)
 - [模块](modules.md)
 - [Node-API](napi.md)
+- [调试器](debugger.md)
 
 # 运行时与样例
 

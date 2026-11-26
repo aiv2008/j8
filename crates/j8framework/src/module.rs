@@ -27,6 +27,7 @@ pub struct ModuleInfo {
     pub star_exports: Vec<usize>,
     pub slots: u16,
     pub lexical: Vec<u16>,
+    pub top_level_await: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Collect)]
@@ -34,7 +35,18 @@ pub struct ModuleInfo {
 pub enum ModuleStatus {
     Linked,
     Evaluating,
+    EvaluatingAsync,
     Evaluated,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Collect)]
+#[collect(require_static)]
+pub struct Evaluation {
+    pub dfs_index: u32,
+    pub dfs_ancestor: u32,
+    pub pending: u32,
+    pub order: Option<u64>,
+    pub cycle_root: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Collect)]
@@ -53,8 +65,12 @@ pub struct ModuleRecord<'scope> {
     pub info: alloc::sync::Arc<ModuleInfo>,
     pub main: FuncId,
     pub code: crate::Code,
+    pub function: JsObject<'scope>,
     pub status: ModuleStatus,
     pub error: Option<Value<'scope>>,
+    pub evaluation: Evaluation,
+    pub async_parents: Vec<u32>,
+    pub capability: Option<JsObject<'scope>>,
     pub requested: Vec<u32>,
     pub imports: Vec<ResolvedBinding<'scope>>,
     pub namespace: Option<JsObject<'scope>>,

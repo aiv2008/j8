@@ -30,6 +30,7 @@ It depends only on `j8framework`, not on the executor: every built-in is a host 
 | `collections.rs`, `weak.rs` | `Map` / `Set`, `WeakMap` / `WeakSet` / `WeakRef` / `FinalizationRegistry` |
 | `promise.rs`, `asyncgen.rs`, `iter.rs` | Promises, async generators, iterators and iterator helpers |
 | `error.rs` | The `Error` family |
+| `intl/` | `Intl` (`Collator`, `NumberFormat`, `DateTimeFormat`, `PluralRules`) and the `toLocale*` methods, behind the `intl` feature (ICU4X) |
 
 Hot built-ins have fast paths that skip the full spec algorithm when nothing observable can differ (an untouched
 `RegExp.prototype`, appending to a dense array, joining strings and numbers). Correctness is checked against test262.

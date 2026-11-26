@@ -463,19 +463,30 @@ impl Arrays {
         if let Some(s) = Self::join_plain(a, o, len, &sep) {
             return Ok(a.string(&s).into());
         }
-        let mut out = String::new();
-        let mut k = 0.0;
-        while k < len {
-            if k > 0.0 {
-                out.push_str(&sep);
+        Self::unless_joining(a, o, |a| {
+            let mut out = String::new();
+            let mut k = 0.0;
+            while k < len {
+                if k > 0.0 {
+                    out.push_str(&sep);
+                }
+                let v = a.get_index(o.into(), k)?;
+                if !v.is_nullish() {
+                    out.push_str(&a.to_string(v)?);
+                }
+                k += 1.0;
             }
-            let v = a.get_index(o.into(), k)?;
-            if !v.is_nullish() {
-                out.push_str(&a.to_string(v)?);
-            }
-            k += 1.0;
+            Ok(out)
+        })
+    }
+
+    fn unless_joining<'scope, 'x>(a: &mut Scope<'scope, 'x>, o: JsObject<'scope>, join: impl FnOnce(&mut Scope<'scope, 'x>) -> Result<String, Error>) -> Result<Value<'scope>, Error> {
+        if !a.joining().enter(o) {
+            return Ok(a.string("").into());
         }
-        Ok(a.string(&out).into())
+        let joined = join(a);
+        a.joining().leave();
+        Ok(a.string(&joined?).into())
     }
 
     fn join_plain<'scope>(a: &Scope<'scope, '_>, o: JsObject<'scope>, len: f64, sep: &str) -> Option<String> {
@@ -538,23 +549,9 @@ impl Arrays {
         a.call(f, o.into(), &[])
     }
 
-    fn to_locale_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+    fn to_locale_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let (o, len) = Self::target(a, this)?;
-        let mut out = String::new();
-        let mut k = 0.0;
-        while k < len {
-            if k > 0.0 {
-                out.push(',');
-            }
-            let v = a.get_index(o.into(), k)?;
-            if !v.is_nullish() {
-                let f = a.get_named(v, "toLocaleString")?;
-                let s = a.call(f, v, &[])?;
-                out.push_str(&a.to_string(s)?);
-            }
-            k += 1.0;
-        }
-        Ok(a.string(&out).into())
+        Self::unless_joining(a, o, |a| crate::LocaleJoin::join(a, o, len, args))
     }
 
     fn reverse<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
@@ -711,10 +708,23 @@ impl Arrays {
 
     #[expect(clippy::too_many_arguments, reason = "one step of a visiting loop")]
     #[inline]
-    fn drive<'scope>(a: &mut Scope<'scope, '_>, cb: &Callback<'scope>, how: Visit, source: JsObject<'scope>, out: Option<JsObject<'scope>>, fresh: bool, k: f64, idx: Option<u32>, run: &mut Option<j8framework::ElementRun<'scope>>, to: &mut f64) -> Result<Option<Value<'scope>>, Error> {
-        let Some(v) = Self::load(a, source, k, idx, run, true)? else { return Ok(None) };
-        let r = Self::apply(a, cb, 3, v, || Value::from(k), || source.into(), || Value::Undefined)?;
-        match (how, out) {
+    fn drive<'scope>(a: &mut Scope<'scope, '_>, cb: &mut Callback<'scope>, how: Visit, source: &mut JsObject<'scope>, out: &mut Option<JsObject<'scope>>, fresh: bool, k: f64, idx: Option<u32>, run: &mut Option<j8framework::ElementRun<'scope>>, to: &mut f64) -> Result<Option<Value<'scope>>, Error> {
+        let src = *source;
+        let Some(v) = Self::load(a, src, k, idx, run, true)? else { return Ok(None) };
+        let mut held = [src.into(), out.map_or(Value::Undefined, Into::into), v, cb.callee, cb.this];
+        let (r, moved) = a.holding(&mut held, |a| Self::apply(a, cb, 3, v, || Value::from(k), || src.into(), || Value::Undefined));
+        let r = r?;
+        let v = if moved {
+            let [s, o, v, callee, this] = held;
+            *source = s.as_object().expect("the held source");
+            *out = o.as_object();
+            *cb = a.callback(callee, this);
+            *run = None;
+            v
+        } else {
+            v
+        };
+        match (how, *out) {
             (Visit::Map, Some(arr)) => {
                 if !(fresh && idx.is_some_and(|i| Self::append_fresh(a, arr, r, i))) {
                     a.create_index(arr, k, r)?;
@@ -913,7 +923,8 @@ impl Arrays {
             }
             _ => (None, false),
         };
-        let cb = a.callback(f, this_arg);
+        let mut cb = a.callback(f, this_arg);
+        let (mut o, mut out) = (o, out);
         if o.is_array()
             && let Some(n) = Self::span(len)
             && let Some(arity) = cb.passed()
@@ -930,14 +941,14 @@ impl Arrays {
         let mut to = 0.0;
         if let Some(n) = Self::span(len) {
             for i in 0..n {
-                if let Some(done) = Self::drive(a, &cb, how, o, out, fresh, f64::from(i), Some(i), &mut run, &mut to)? {
+                if let Some(done) = Self::drive(a, &mut cb, how, &mut o, &mut out, fresh, f64::from(i), Some(i), &mut run, &mut to)? {
                     return Ok(done);
                 }
             }
         } else {
             let mut k = 0.0;
             while k < len {
-                if let Some(done) = Self::drive(a, &cb, how, o, out, fresh, k, None, &mut run, &mut to)? {
+                if let Some(done) = Self::drive(a, &mut cb, how, &mut o, &mut out, fresh, k, None, &mut run, &mut to)? {
                     return Ok(done);
                 }
                 k += 1.0;
@@ -1137,6 +1148,7 @@ impl Arrays {
                 if depth > 0.0 && a.is_array(v)? {
                     let Some(inner) = v.as_object() else { unreachable!("arrays are objects") };
                     let inner_len = a.length_of_array_like(v)?;
+                    a.check_stack()?;
                     to = Self::flatten(a, target, inner, inner_len, to, depth - 1.0, Value::Undefined, Value::Undefined)?;
                 } else {
                     if to >= MAX_LENGTH {

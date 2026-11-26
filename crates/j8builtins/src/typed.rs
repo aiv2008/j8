@@ -539,21 +539,10 @@ impl Typed {
         Ok(a.string(&out).into())
     }
 
-    fn to_locale_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+    fn to_locale_string<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
         let (o, _, _, len) = Self::validate(a, this)?;
-        let mut out = String::new();
-        for k in 0..len {
-            if k > 0 {
-                out.push(',');
-            }
-            let v = a.get_index(o.into(), Self::f(k))?;
-            if !v.is_nullish() {
-                let f = a.get_named(v, "toLocaleString")?;
-                let s = a.call(f, v, &[])?;
-                out.push_str(&a.to_string(s)?);
-            }
-        }
-        Ok(a.string(&out).into())
+        let joined = crate::LocaleJoin::join(a, o, Self::f(len), args)?;
+        Ok(a.string(&joined).into())
     }
 
     fn elements<'scope>(a: &Scope<'scope, '_>, kind: ElementKind, view: &ViewData<'scope>, len: usize) -> Vec<Value<'scope>> {

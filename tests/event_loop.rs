@@ -171,7 +171,7 @@ fn the_queue_is_checked_between_slices_of_a_script() {
         lp.enter(move |a| {
             let promise = a.new_promise();
             let (resolve, reject) = a.promise_resolvers(promise);
-            let job = j8framework::AsyncJob { resolve: a.global(resolve.into()), reject: a.global(reject.into()), future: Box::pin(delayed) };
+            let job = j8framework::AsyncJob::new(a.global(resolve.into()), a.global(reject.into()), Box::pin(delayed));
             assert!(a.spawn(job).is_ok(), "the event loop takes host work");
             let p = a.global(promise.into());
             let v = a.local(&p);

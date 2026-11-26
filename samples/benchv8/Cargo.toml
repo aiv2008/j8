@@ -12,7 +12,7 @@ readme = "README.md"
 
 [dependencies]
 v8 = "=152.2.0"
-j8 = { version = "0.4.0", features = ["jit"] }
+j8 = { version = "0.5.1", features = ["jit"] }
 
 [profile.release]
 debug = false

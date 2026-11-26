@@ -31,6 +31,7 @@
 - [Async and promises](async.md)
 - [Modules](modules.md)
 - [Node-API](napi.md)
+- [Debugger](debugger.md)
 
 # Runtimes and samples
 

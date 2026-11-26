@@ -175,9 +175,34 @@ For lower-level work, `rt.enter(|a| …)` gives you the context's `Scope` (`a.ge
 
 | Variant | Meaning | What hosts do |
 |---|---|---|
-| `Error::Exception` | JS threw; the value waits in the isolate's pending slot, as in V8 | `rt.exception_text()` ⇒ `Uncaught …` |
+| `Error::Exception` | JS threw; the value waits in the isolate's pending slot, as in V8 | `rt.exception_text()` ⇒ `Uncaught …` with the stack |
 | `Error::Syntax(msg)` | the source doesn't parse | print `msg` |
 | `Error::Unsupported(msg)` | syntax j8 doesn't support yet | print `msg` |
+
+## Stack traces
+
+Every error object gets a V8-style `stack` (`new Error()`, errors the engine throws, and `a.throw` in a binding,
+whose top frame is the JS call of the binding):
+
+```text
+Error: boom
+    at inner (main.js:2:10)
+    at new Box (main.js:6:14)
+    at main.js:9:1
+```
+
+- `stack` is an accessor on `Error.prototype`, as in the TC39 proposal (V8 puts one on each error): made when read, from
+  the error's `name` and `message` at that time; assigning a string puts an own `stack` in front of it. `Error.stackTraceLimit` (10, read from `Error` itself) caps the frames; `Error.captureStackTrace(obj)` puts one on
+  any object.
+- An error keeps only its frames (code, bytecode offset, whether it constructs); names, scripts, lines and columns are
+  looked up when `stack` is read, so errors nobody reads cost no formatting.
+- `a.stack_trace(limit)` gives the running JS frames, innermost first, as `CallSite { function, script, line, column,
+  constructor }` (1-based, columns in UTF-16 units; `Display` prints the frame as `stack` does). `a.stack_text(v)` is a
+  thrown value's `stack`, or its ToString without one; `Runtime::exception_text` uses it.
+- Positions come from a table the compiler writes next to the bytecode (`BytecodeArray::positions`, bytecode offset
+  ⇒ line and column), marked at statements, calls, `new` and property loads, as V8 does.
+- Not shown yet: built-in frames, receiver type names (`Object.method`), async frames, `captureStackTrace`'s frame to
+  hide. With the JIT on, a function running as compiled code can be missing or point at the line it was entered on.
 
 ## Building on another runtime
 

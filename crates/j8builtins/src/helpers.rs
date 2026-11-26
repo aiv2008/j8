@@ -6,7 +6,9 @@ use j8framework::{Scope, Error, ErrorKind, HelperKind, HelperState, IterRecord, 
 
 use crate::{Args, Installer};
 
-struct Helpers;
+pub(crate) struct Helpers;
+
+const ITERATOR_PROTO: &str = "Cannot assign to this property of Iterator.prototype";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Probe {
@@ -373,12 +375,12 @@ impl Helpers {
         Ok(a.context.global.borrow().own(a.mc, "Iterator").unwrap_or_default())
     }
 
-    fn ignoring_setter<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, key: Key<'_, 'scope>, v: Value<'scope>) -> Result<Value<'scope>, Error> {
+    pub(crate) fn ignoring_setter<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, home: (JsObject<'scope>, &str), key: Key<'_, 'scope>, v: Value<'scope>) -> Result<Value<'scope>, Error> {
         let Some(o) = this.as_object() else {
             return Err(a.throw(ErrorKind::Type, "setter called on a non-object"));
         };
-        if j8framework::ScopeLocal::ptr_eq(o, a.context.iterator_proto) {
-            return Err(a.throw(ErrorKind::Type, "Cannot assign to this property of Iterator.prototype"));
+        if j8framework::ScopeLocal::ptr_eq(o, home.0) {
+            return Err(a.throw(ErrorKind::Type, home.1));
         }
         if a.get_own_property(o, key)?.is_none() {
             a.create_data_property_or_throw(o, key, v)?;
@@ -390,11 +392,11 @@ impl Helpers {
     }
 
     fn tag_set<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-        Self::ignoring_setter(a, this, Key::Sym(a.context.symbols.to_string_tag), args.at(0))
+        Self::ignoring_setter(a, this, (a.context.iterator_proto, ITERATOR_PROTO), Key::Sym(a.context.symbols.to_string_tag), args.at(0))
     }
 
     fn ctor_set<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
-        Self::ignoring_setter(a, this, Key::Str("constructor"), args.at(0))
+        Self::ignoring_setter(a, this, (a.context.iterator_proto, ITERATOR_PROTO), Key::Str("constructor"), args.at(0))
     }
 }
 

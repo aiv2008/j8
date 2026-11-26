@@ -295,7 +295,7 @@ napi! {
     }
 
     fn napi_is_error(env, value: Handle, result: *mut bool) {
-        Ffi::put(result, env.kind_is(value, |k| matches!(k, ObjectKind::Error))?)
+        Ffi::put(result, env.kind_is(value, |k| matches!(k, ObjectKind::Error(_)))?)
     }
 
     fn napi_is_arraybuffer(env, value: Handle, result: *mut bool) {

@@ -422,10 +422,10 @@ pub enum Reaction<'scope> {
 
 pub struct HostReaction(pub Box<HostReactionFn>);
 
-pub type HostReactionFn = dyn for<'g, 'x> FnOnce(&mut crate::Scope<'g, 'x>, Value<'g>, bool) + Send + Sync;
+pub type HostReactionFn = dyn for<'g, 'x> FnOnce(&mut crate::Scope<'g, 'x>, Value<'g>, bool) -> Result<(), crate::Error> + Send + Sync;
 
 impl HostReaction {
-    pub fn new(f: impl for<'g, 'x> FnOnce(&mut crate::Scope<'g, 'x>, Value<'g>, bool) + Send + Sync + 'static) -> Self {
+    pub fn new(f: impl for<'g, 'x> FnOnce(&mut crate::Scope<'g, 'x>, Value<'g>, bool) -> Result<(), crate::Error> + Send + Sync + 'static) -> Self {
         Self(Box::new(f))
     }
 }
@@ -451,6 +451,11 @@ pub struct Capability<'scope> {
 pub enum Job<'scope> {
     Reaction { reaction: Reaction<'scope>, value: Value<'scope>, rejected: bool },
     Thenable { promise: JsObject<'scope>, thenable: Value<'scope>, then: Value<'scope> },
+    Import {
+        #[collect(require_static)]
+        module: u32,
+        promise: JsObject<'scope>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -775,14 +780,14 @@ pub enum ObjectKind<'scope> {
     #[default]
     Ordinary,
     Arguments(Option<ArgumentsMap<'scope>>),
-    Error,
+    Error(Vec<crate::Captured>),
     Array,
     Function(Closure<'scope>),
     Native(Native),
     Bound(Box<Bound<'scope>>),
     Iterator(IteratorState<'scope>),
     Coroutine(Box<Coroutine<'scope>>),
-    Promise { state: Settled<'scope>, reactions: Vec<Reaction<'scope>> },
+    Promise { state: Settled<'scope>, reactions: Vec<Reaction<'scope>>, handled: bool },
     Resolver { promise: JsObject<'scope>, reject: bool, done: ScopeLocal<'scope, core::sync::atomic::AtomicBool> },
     RegExp(RegExpData<'scope>),
     Primitive(Value<'scope>),
@@ -955,7 +960,7 @@ impl fmt::Debug for ObjectState<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.kind {
             ObjectKind::Ordinary | ObjectKind::Arguments(_) | ObjectKind::AccessorPair { .. } => "Object",
-            ObjectKind::Error => "Error",
+            ObjectKind::Error(_) => "Error",
             ObjectKind::Array => "Array",
             ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_) | ObjectKind::Resolver { .. } | ObjectKind::NativeClosure(_) => "Function",
             ObjectKind::Proxy(_) => "Proxy",
@@ -1007,9 +1012,9 @@ impl Class {
         if !state.symbols.is_empty() || !state.privates.is_empty() {
             return None;
         }
-        match state.kind {
+        match &state.kind {
             ObjectKind::Ordinary => Some(Self::UNIT_ORDINARY),
-            ObjectKind::Error => Some(Self::UNIT_ERROR),
+            ObjectKind::Error(frames) if frames.is_empty() => Some(Self::UNIT_ERROR),
             ObjectKind::Array | ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::RegExp(_) => Some(Self::UNIT_DERIVED),
             _ => None,
         }
@@ -1017,7 +1022,7 @@ impl Class {
 
     fn unit_state<'scope>(class: u8, fast: Option<&Fast<'scope>>) -> ObjectState<'scope> {
         let kind = match (class & Self::UNIT_MASK, fast) {
-            (Self::UNIT_ERROR, _) => ObjectKind::Error,
+            (Self::UNIT_ERROR, _) => ObjectKind::Error(Vec::new()),
             (Self::UNIT_DERIVED, Some(Fast::Closure(c))) => ObjectKind::Function(*c),
             (Self::UNIT_DERIVED, Some(Fast::Native(n))) => ObjectKind::Native(*n),
             (Self::UNIT_DERIVED, Some(Fast::RegExp(r))) => ObjectKind::RegExp(*r),

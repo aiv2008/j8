@@ -25,20 +25,21 @@ A JavaScript engine in Rust, layered like V8:
 - **Heap:** [paragc](https://crates.io/crates/paragc). There is no `'static` and no global state.
 - **Parsing:** oxc.
 
-Core ECMAScript is covered except what [PLAN.md](PLAN.md) puts out of scope (Temporal, intl402, …).
-Top-level await in modules is not supported yet.
+Core ECMAScript is covered except what [PLAN.md](PLAN.md) puts out of scope (Temporal, ShadowRealm, …).
+`Intl` (Collator, NumberFormat, DateTimeFormat, PluralRules, ListFormat, Segmenter, Locale, RelativeTimeFormat, DisplayNames, DurationFormat) is the opt-in `intl` feature, built on ICU4X.
 
 | Check | Result |
 | --- | --- |
 | test262 baseline | **42,500** passing, interpreter and JIT, no regression allowed |
-| vs V8 jitless | **0.6×** the time (geometric mean over 11 benchmarks) |
-| vs V8 (with JIT) | **1.7×** the time, see [benchmark.md](samples/benchv8/benchmark.md) |
+| vs V8 jitless | **0.4×** the time (geometric mean over 11 benchmarks) |
+| vs V8 (with JIT) | **1.1×** the time, see [benchmark.md](samples/benchv8/benchmark.md) |
 
 ## 📦 Install
 
 ```sh
 cargo add j8                                    # executor + builtins + standard platform
 cargo add j8 --features jit                     # plus the JIT (x86-64 Unix / Windows, AArch64 Linux)
+cargo add j8 --features intl                    # plus Intl and the host time zone for Date (ICU4X data, about 7 MB)
 cargo add j8 --features crossheap               # Linux: share heap objects across processes
 cargo add j8 --no-default-features --features compiler   # JS ⇒ bytecode only
 ```

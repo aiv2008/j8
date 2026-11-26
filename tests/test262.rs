@@ -243,8 +243,9 @@ impl Case {
         let expected = self.meta.negative.as_ref();
         let cx = isolate.create_context(&Builtins);
         let r = if self.has(Flag::Module) {
+            let module = std::fs::canonicalize(&self.path).map_or(file, |p| p.display().to_string());
             match executor.eval(&mut isolate, &cx, &Source { text: &src, file: "[harness]" }) {
-                Ok(_) => executor.eval_module(&mut isolate, &cx, &Source { text: &self.text, file: &file }),
+                Ok(_) => executor.eval_module(&mut isolate, &cx, &Source { text: &self.text, file: &module }),
                 e => e,
             }
         } else {

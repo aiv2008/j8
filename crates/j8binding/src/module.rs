@@ -20,7 +20,7 @@ impl Glue {
     pub fn spawn<'scope>(a: &mut Scope<'scope, '_>, future: impl core::future::Future<Output = j8framework::Settle> + Send + 'static) -> Result<j8framework::Value<'scope>, j8framework::Error> {
         let promise = a.new_promise();
         let (resolve, reject) = a.promise_resolvers(promise);
-        let job = j8framework::AsyncJob { resolve: a.global(resolve.into()), reject: a.global(reject.into()), future: alloc::boxed::Box::pin(future) };
+        let job = j8framework::AsyncJob::new(a.global(resolve.into()), a.global(reject.into()), alloc::boxed::Box::pin(future));
         match a.spawn(job) {
             Ok(()) => Ok(promise.into()),
             Err(_) => Err(a.throw(j8framework::ErrorKind::Type, "async host functions need a runtime with an event loop (j8::Runtime::run_until_idle)")),

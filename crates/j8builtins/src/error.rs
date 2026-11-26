@@ -1,7 +1,13 @@
-use j8framework::ValueKind;
-use j8framework::{Scope, Error, ErrorKind, Value};
+use j8framework::{Scope, Error, ErrorKind, Key, ObjectKind, Property, Slot, Value};
 
+use crate::helpers::Helpers;
 use crate::{Args, Installer};
+
+const STACK_TRACE_LIMIT: f64 = 10.0;
+
+const STACK: &str = "stack";
+
+const ERROR_PROTO: &str = "Cannot assign to this property of Error.prototype";
 
 struct Errors;
 
@@ -38,19 +44,35 @@ impl Errors {
         if this.as_object().is_none() {
             return Err(a.throw(ErrorKind::Type, "Error.prototype.toString called on non-object"));
         }
-        let name = match (a.get_named(this, "name")?).kind() {
-            ValueKind::Undefined => a.string("Error"),
-            v => a.to_string(Value::from(v))?,
-        };
-        let msg = match (a.get_named(this, "message")?).kind() {
-            ValueKind::Undefined => a.string(""),
-            v => a.to_string(Value::from(v))?,
-        };
-        Ok(match (name.is_empty(), msg.is_empty()) {
-            (_, true) => name.into(),
-            (true, false) => msg.into(),
-            (false, false) => a.string(&alloc::format!("{}: {}", &**name, &**msg)).into(),
-        })
+        Ok(a.error_text(this)?.into())
+    }
+
+    fn capture_stack_trace<'scope>(a: &mut Scope<'scope, '_>, _: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+        let target = args.at(0);
+        let Some(o) = target.as_object() else { return Err(a.throw(ErrorKind::Type, "Invalid argument")) };
+        let header = a.error_text(target)?;
+        let text = a.string(&alloc::format!("{}{}", &**header, a.stack_frames(&a.capture())));
+        o.borrow_mut(a.mc).define(STACK, Property::hidden(text.into()));
+        Ok(Value::Undefined)
+    }
+
+    fn stack_get<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, _: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+        let Some(o) = this.as_object() else { return Err(a.throw(ErrorKind::Type, "Error.prototype.stack getter called on non-object")) };
+        if !matches!(o.borrow().kind, ObjectKind::Error(_)) {
+            return Ok(Value::Undefined);
+        }
+        Ok(a.error_stack(o)?.into())
+    }
+
+    fn stack_set<'scope>(a: &mut Scope<'scope, '_>, this: Value<'scope>, args: &[Value<'scope>]) -> Result<Value<'scope>, Error> {
+        if this.as_object().is_none() {
+            return Err(a.throw(ErrorKind::Type, "Error.prototype.stack setter called on non-object"));
+        }
+        let v = args.at(0);
+        if v.as_string().is_none() {
+            return Err(a.throw(ErrorKind::Type, "Error.prototype.stack must be set to a string"));
+        }
+        Helpers::ignoring_setter(a, this, (a.context.error_proto(ErrorKind::Error), ERROR_PROTO), Key::Str(STACK), v)
     }
 }
 
@@ -69,14 +91,26 @@ impl Installer<'_, '_> {
         let mut base = None;
         for (kind, f) in ErrorKind::ALL.into_iter().zip(ctors) {
             let proto = self.context.error_proto(kind);
-            let ctor = self.constructor(kind.name(), f, proto, if kind == ErrorKind::Aggregate { 2 } else { 1 });
+            let length = if kind == ErrorKind::Aggregate { 2 } else { 1 };
+            let ctor = match kind {
+                ErrorKind::Error => self.adopt_constructor(self.context.error_ctor, kind.name(), f, proto, length),
+                _ => self.constructor(kind.name(), f, proto, length),
+            };
             match base {
-                None => base = Some(ctor),
+                None => {
+                    self.method(ctor, "captureStackTrace", Errors::capture_stack_trace, 2);
+                    ctor.borrow_mut(self.mc).define("stackTraceLimit", Property::data(Value::from(STACK_TRACE_LIMIT)));
+                    base = Some(ctor);
+                }
                 Some(b) => ctor.set_proto(self.mc, Some(b)),
             }
             self.set(proto, "name", self.text(kind.name()));
             self.set(proto, "message", self.text(""));
         }
         self.method(self.context.error_proto(ErrorKind::Error), "toString", Errors::to_string, 0);
+        let get = self.context.named_native(self.mc, Errors::stack_get, &alloc::format!("get {STACK}"), 0);
+        let set = self.context.named_native(self.mc, Errors::stack_set, &alloc::format!("set {STACK}"), 1);
+        let accessor = Property { slot: Slot::Accessor { get: Some(get), set: Some(set) }, enumerable: false, writable: false, configurable: true };
+        self.context.error_proto(ErrorKind::Error).borrow_mut(self.mc).define(STACK, accessor);
     }
 }

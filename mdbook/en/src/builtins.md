@@ -28,25 +28,51 @@ through `Invoke`.
 | `promise.rs`, `asyncgen.rs`, `iter.rs` | `Promise`, async generators, iterators and iterator helpers |
 | `error.rs` | `Error`, `TypeError` … `AggregateError`, `cause` |
 | `helpers.rs` | shared spec steps |
+| `intl/` | `Intl` and the locale-sensitive methods, with the `intl` feature (see below) |
 
 ## Coverage
 
 - **Object / Array**: every method; Array methods generic over array-likes, species; `from` / `flat` / `toSorted` /
-  `with` …
+  `with` …; `join` / `toLocaleString` give `""` for an array already being joined (as V8 and SpiderMonkey do), keeping
+  the arrays being joined on the `Scope` (`Scope::joining`, a `Visiting` stack, the same one `JSON.stringify` uses to
+  find cycles);
 - **Reflection**: `Reflect`, `Proxy` (revocable too);
 - **Iterator helpers**: the global `Iterator`, `Iterator.from`, `map` / `filter` / `take` / `drop` / `flatMap` /
   `reduce` …; Set methods (`union` …), `Map.groupBy` / `Object.groupBy`;
 - **Binary data**: resizable `ArrayBuffer` (`transfer`, detach), growable `SharedArrayBuffer`, `DataView`, `Atomics`
   (single-threaded semantics);
-- **Date** (the local time zone is UTC); **number formatting** (`toFixed` / `toPrecision` / `toExponential` with exact
-  decimals), `Math.sumPrecise` / `f16round`;
+- **Date** (the local time zone comes from `Platform::time_zone` with the `intl` feature, UTC otherwise); **number
+  formatting** (`toFixed` / `toPrecision` / `toExponential` with exact decimals), `Math.sumPrecise` / `f16round`;
 - **RegExp**: the Symbol protocol, `lastIndex`, the `d` flag, named groups, species, `RegExp.escape`; the string methods
   `match` / `matchAll` / `replace` / `replaceAll` / `search` / `split`;
 - **Promise** built on NewPromiseCapability: subclassing, `all` / `race` / `allSettled` / `any` / `withResolvers` / `try`;
 - built-in constructors take the prototype from `new.target`, so `class X extends Map` works; host functions tell
   constructible from not.
 
-Out of scope: Temporal, intl402, ShadowRealm and others (see the [Roadmap](roadmap.md)).
+Out of scope: Temporal, ShadowRealm and others (see the [Roadmap](roadmap.md)).
+
+## Intl
+
+The `intl` feature (`j8builtins/intl`, re-exported as `j8/intl`) adds ECMA-402 on top of
+[ICU4X](https://github.com/unicode-org/icu4x) with its compiled data, so no data files are needed at run time:
+
+- `Intl.getCanonicalLocales`, `Intl.supportedValuesOf`, `supportedLocalesOf`; locale negotiation treats a locale as
+  available when ICU4X's likely-subtags data knows its language;
+- `Intl.Collator` and `String.prototype.localeCompare`; `toLocaleUpperCase` / `toLocaleLowerCase` (Turkish, Azeri,
+  Lithuanian rules);
+- `Intl.NumberFormat`: digit options and all rounding modes, scientific / engineering / compact notation, sign display,
+  grouping, numbering systems, `formatToParts`; `Number` / `BigInt` `toLocaleString`. Currency and unit styles print the
+  ISO code or the unit identifier, percent a plain `%` (the CLDR patterns for these are not in ICU4X's stable data);
+- `Intl.DateTimeFormat`: the component options, `dateStyle` / `timeStyle`, hour cycles, calendars, IANA time zones and
+  UTC offsets (time zone rules from the tzdb bundled by [jiff](https://crates.io/crates/jiff)), `formatToParts`;
+  `Date` `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString`;
+- `Intl.PluralRules`: cardinal and ordinal rules, `select` rounding as NumberFormat does, `selectRange`;
+- the default locale and time zone come from `Platform::locale` / `Platform::time_zone`, falling back to `en-US` and
+  `UTC`; with a time zone, `Date`'s local-time methods and `toString` use it too.
+
+Option objects are read in the order the spec gives, so the getters a test262 case installs fire in the same order.
+Each `Intl` instance is a host object holding the ICU4X formatter built at construction. Data costs about 7 MB in a
+stripped binary.
 
 ## Regexps: two engines
 

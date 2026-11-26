@@ -71,7 +71,7 @@ impl From<&ObjectKind<'_>> for Kind {
     fn from(kind: &ObjectKind<'_>) -> Self {
         match kind {
             ObjectKind::Arguments(_) => Self::Arguments,
-            ObjectKind::Error => Self::Error,
+            ObjectKind::Error(_) => Self::Error,
             ObjectKind::Array => Self::Array,
             ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_) | ObjectKind::Resolver { .. } | ObjectKind::NativeClosure(_) => Self::Function,
             ObjectKind::Coroutine(c) if c.promise.is_none() || c.requests.is_some() => Self::Generator,

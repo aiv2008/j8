@@ -12,6 +12,12 @@
 
 - **显式帧栈**：JS 调 JS 不靠宿主（Rust）递归，执行器自己维护帧栈。调用深度上限 10,000（含宿主函数里重入的 JS），
   超了抛 `RangeError`。
+- **宿主栈另有按字节数的上限**：调用深度上限按层数计，管的是堆上的执行器帧栈；而宿主函数回调 JS（`join` → `toString`
+  → `join`、Proxy 的陷阱、`Function.prototype.call`）或自己递归（`JSON.stringify` / `JSON.parse` / reviver、
+  `Array.prototype.flat`、不带陷阱层层嵌套的 Proxy）用的是宿主栈，每层用多少不一定。`Scope::check_stack` 在栈比进入
+  isolate 时深了 `CreateParams::stack_size`（默认 984 KiB，即 V8 的 `--stack-size`）时抛 `RangeError`。检查点在宿主
+  调回 JS 的地方（`Invoke` 的 call / construct / resume）、每次查 Proxy 陷阱时，以及上面那些递归的每一步。进入
+  isolate 的线程在进入点以下要留出这么多栈，再加上检查失败时正在运行的宿主函数要用的一点：默认设置下 1 MiB。
 - **一个寄存器文件**：全部帧共用。一帧占其中一段：receiver、形参、r0 起的寄存器。字节码里的寄存器操作数是 V8
   的帧槽号（r0 是 −7、receiver 是 +2、上下文 −1、闭包 −2），加载时映射到这段上。
 - **上下文**就是堆上的 `Env`：寄存器与累加器在 `CreateFunctionContext` / `PushContext` / `PopContext` 之间以
@@ -32,6 +38,8 @@ handler(cx, pc, regs, acc)  ─ 做完 ─▶  直接跳到下一条指令的 ha
 热门字节码有自己的处理函数；其余字节码、以及热门字节码离开快路时，经 `slow` 同步状态后走通用的 `Executor::step`。
 帧变化（调用、返回）、异常、执行结束时离开处理函数链。
 
+处理函数放在 `Cell` 里：[调试器](debugger.md)设断点时把它换掉，清除时换回，不碰的指令不做任何检查。
+
 ## 内联缓存
 
 `ic.rs`：每个 `GetNamedProperty` / `SetNamedProperty` / `DefineNamedOwnProperty` 点一个缓存。
@@ -47,7 +55,7 @@ handler(cx, pc, regs, acc)  ─ 做完 ─▶  直接跳到下一条指令的 ha
 ## 分片执行
 
 `Executor::eval` 拿 `&mut Isolate`，自己分片进入：每片最多一万条指令，停下时把执行状态挂到根上、让堆回收一段，
-再接着跑。执行环境以 `ScopeGlobal<'p, ContextBrand>` 跨片保留。每 1024 条指令检查一次预算与终止请求——在事件循环里，这就是检查
+再接着跑。执行环境以 `ScopeGlobal<'p, ContextBrand>` 跨片保留。每 1024 条指令检查一次预算、终止与中断请求——在事件循环里，这就是检查
 任务队列的时机（[事件循环](event-loop.md)）。
 
 已知偏差：宿主函数里重入的 JS（如 `map` 的回调）在当前片里跑完，期间不回收。`Function.prototype.call` / `apply`
@@ -64,9 +72,9 @@ handler(cx, pc, regs, acc)  ─ 做完 ─▶  直接跳到下一条指令的 ha
 
 ## ES 模块
 
-`module.rs`：加载、链接、求值（同步：依赖经 `Platform::load_module` 读进来）。import 绑定实时读导出方的槽，
-`ResolveExport` 处理间接导出、`export *` 与歧义；命名空间对象、动态 `import()`、`import.meta` 都支持。
-模块的顶层 `await` 还不支持。
+`module.rs`：加载、链接（同步：依赖经 `Platform::load_module` 读进来）；求值（含顶层 `await`）是 j8framework 的
+`Scope::evaluate_module`。import 绑定实时读导出方的槽，`ResolveExport` 处理间接导出、`export *` 与歧义；命名空间对象、
+动态 `import()`、`import.meta` 都支持。
 
 ## CodeCache
 

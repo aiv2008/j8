@@ -34,8 +34,8 @@ function and returns its exports.
 - Strings are stored as UTF-8: lone surrogates in UTF-16 input are replaced.
 - Buffers are plain `Uint8Array`s (there is no Node `Buffer` class).
 - Async work and thread-safe functions need an isolate with an event loop (`EventLoopSet`); async work runs on a
-  thread of its own. `napi_unref_threadsafe_function` does not let the loop finish early, and there is no libuv loop
-  (`napi_get_uv_event_loop` fails).
+  thread of its own. As in Node, a thread-safe function keeps the loop running (`run_until_idle` waits) until it is
+  released or `napi_unref_threadsafe_function` is called. There is no libuv loop (`napi_get_uv_event_loop` fails).
 
 ## License
 
