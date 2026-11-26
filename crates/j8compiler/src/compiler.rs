@@ -1178,10 +1178,14 @@ impl<'a> Compiler<'a, '_> {
     }
 
     fn prologue(&mut self, params: &'a FormalParameters<'a>) -> Result<(), Error> {
+        let saved = self.enter_parameters(params);
         for (i, p) in (0u16..).zip(&params.items) {
             let reg = Register::parameter(i32::from(i) + 1);
             if let Some(init) = &p.initializer {
-                self.b().ldar(reg);
+                match saved.get(usize::from(i)) {
+                    Some(&t) => self.b().ldar(t),
+                    None => self.b().ldar(reg),
+                }
                 let mut skip = Label::default();
                 self.b().jump(Bytecode::JumpIfNotUndefined, &mut skip);
                 match &p.pattern {
@@ -1190,11 +1194,15 @@ impl<'a> Compiler<'a, '_> {
                 }
                 self.b().star(reg);
                 self.b().bind(&mut skip);
+            } else if let Some(&t) = saved.get(usize::from(i)) {
+                self.b().ldar(t);
+                self.b().star(reg);
             }
             match &p.pattern {
                 BindingPattern::BindingIdentifier(id) => {
                     let name = id.name.as_str();
-                    if p.initializer.is_some() && !matches!(self.lookup(name).0, Place::Reg(r) if r == reg) {
+                    let copied_on_entry = saved.is_empty() && p.initializer.is_none();
+                    if !copied_on_entry && !matches!(self.lookup(name).0, Place::Reg(r) if r == reg) {
                         self.b().ldar(reg);
                         self.store(name, true);
                     }
@@ -1209,7 +1217,45 @@ impl<'a> Compiler<'a, '_> {
             self.bind_pattern(&r.rest.argument, t, true)?;
             self.release(t);
         }
+        for &t in saved.iter().rev() {
+            self.release(t);
+        }
         Ok(())
+    }
+
+    /// Non-simple parameter list: the incoming arguments are copied into temporaries, every parameter binding is set
+    /// to the hole and marked ready at the end of its own parameter, so a default value that reads a later parameter
+    /// (or itself) carries a hole check. Initialization then runs left to right, as the spec requires. A simple list
+    /// needs none of this: nothing is evaluated between two initializations, so nothing can observe the dead zone.
+    fn enter_parameters(&mut self, params: &'a FormalParameters<'a>) -> Vec<Register>{
+        if self.frame().simple_params{
+            return Vec::new();
+        }
+        let saved: Vec<Register> = params.items.iter().map(|_|{self.temp()}).collect();
+        for (i, &t) in (0u16..).zip(&saved){
+            self.b().ldar(Register::parameter(i32::from(i)+1));
+            self.b().star(t);
+        }
+        if let Some(level) = self.levels.last_mut() {
+            for p in &params.items {
+                let BindingPattern::BindingIdentifier(id) = &p.pattern else {
+                    continue;
+                };
+                let end = p.initializer.as_ref().map_or(p.pattern.span().end, |init| init.span().end.max(p.pattern.span().end));
+                if let Some(b) = level.names.iter_mut().find(|b| b.name == id.name.as_str()) {
+                    b.ready = Some(end);
+                }
+            }
+        }
+        for p in &params.items {
+            if let BindingPattern::BindingIdentifier(id) = &p.pattern{
+
+                self.b().load_the_hole();
+                self.store(&id.name, true);
+            }
+        }
+        saved
+        // unimplemented!()
     }
 
     pub fn bind_pattern(&mut self, p: &'a BindingPattern<'a>, value: Register, init: bool) -> Result<(), Error> {
