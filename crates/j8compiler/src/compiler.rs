@@ -211,6 +211,8 @@ struct Frame<'a> {
     eval: bool,
     prologue: bool,
     simple_params: bool,
+    param_dead_zone: u16,
+    param_names: Vec<(&'a str, u16)>,
 }
 
 impl Frame<'_> {
@@ -913,6 +915,15 @@ impl<'a> Compiler<'a, '_> {
     }
 
     pub fn load_at(&mut self, name: &'a str, pos: u32) {
+        if self.frame().prologue{
+            let current = self.frame().param_dead_zone;
+            let later = self.frame().param_names.iter().any(|&(n, index)| n == name && index >= current);
+            if later{
+                self.b().load_the_hole();
+                self.b().throw_reference_error_if_hole(name);
+                return;
+            }
+        }
         let r = self.resolve(name);
         match r.place {
             Place::Reg(reg) => self.b().ldar(reg),
@@ -1016,6 +1027,8 @@ impl<'a> Compiler<'a, '_> {
             eval: false,
             prologue: false,
             simple_params,
+            param_dead_zone: 0,
+            param_names: Vec::new(),
         });
         if flavor.generator || flavor.asynchronous {
             let g = self.temp();
@@ -2442,6 +2455,8 @@ impl<'a> Compiler<'a, '_> {
             eval: false,
             prologue: false,
             simple_params: false,
+            param_dead_zone: 0,
+            param_names: Vec::new(),
         });
         if !asynchronous {
             self.module_statements(program)?;
@@ -2557,6 +2572,8 @@ impl<'a> Compiler<'a, '_> {
             eval: eval && direct,
             prologue: false,
             simple_params: false,
+            param_dead_zone: 0,
+            param_names: Vec::new(),
         });
         let completion = self.temp();
         self.frame().completion = Some(completion);
